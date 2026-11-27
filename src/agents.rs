@@ -21,52 +21,84 @@ pub const AGENTS_MD_SNIPPET: &str = r#"## macOS Worktrees (Caisson)
 #[derive(Debug, Clone, Copy)]
 struct AgentSpec {
     id: &'static str,
+    aliases: &'static [&'static str],
     display_name: &'static str,
     detect_rel: &'static str,
+    home_bins: &'static [&'static str],
+    path_bins: &'static [&'static str],
+    app_bundles: &'static [&'static str],
     skill_rel: &'static str,
 }
 
 const KNOWN_AGENTS: &[AgentSpec] = &[
     AgentSpec {
         id: "claude",
+        aliases: &["claude-code"],
         display_name: "Claude Code",
         detect_rel: ".claude",
+        home_bins: &[".local/bin/claude"],
+        path_bins: &["claude"],
+        app_bundles: &[],
         skill_rel: ".claude/skills/caisson/SKILL.md",
     },
     AgentSpec {
         id: "codex",
+        aliases: &[],
         display_name: "OpenAI Codex",
         detect_rel: ".codex",
+        home_bins: &[".local/bin/codex"],
+        path_bins: &["codex"],
+        app_bundles: &[],
         skill_rel: ".codex/skills/caisson/SKILL.md",
     },
     AgentSpec {
         id: "antigravity",
-        display_name: "Antigravity (AGY)",
-        detect_rel: ".gemini",
-        skill_rel: ".gemini/antigravity/skills/caisson/SKILL.md",
+        aliases: &["agy"],
+        display_name: "Antigravity (agy)",
+        detect_rel: ".gemini/config",
+        home_bins: &[".local/bin/agy"],
+        path_bins: &["agy"],
+        app_bundles: &["/Applications/Antigravity.app"],
+        skill_rel: ".gemini/config/skills/caisson/SKILL.md",
     },
     AgentSpec {
         id: "cursor",
+        aliases: &[],
         display_name: "Cursor",
         detect_rel: ".cursor",
+        home_bins: &[],
+        path_bins: &[],
+        app_bundles: &["/Applications/Cursor.app"],
         skill_rel: ".cursor/skills/caisson/SKILL.md",
     },
     AgentSpec {
         id: "opencode",
+        aliases: &[],
         display_name: "OpenCode",
         detect_rel: ".config/opencode",
+        home_bins: &[".local/bin/opencode"],
+        path_bins: &["opencode"],
+        app_bundles: &[],
         skill_rel: ".config/opencode/skills/caisson/SKILL.md",
     },
     AgentSpec {
         id: "windsurf",
+        aliases: &[],
         display_name: "Windsurf",
         detect_rel: ".codeium/windsurf",
+        home_bins: &[],
+        path_bins: &[],
+        app_bundles: &["/Applications/Windsurf.app"],
         skill_rel: ".codeium/windsurf/skills/caisson/SKILL.md",
     },
     AgentSpec {
         id: "agents",
+        aliases: &[],
         display_name: "Open Agent Skills (~/.agents)",
         detect_rel: ".agents",
+        home_bins: &[],
+        path_bins: &[],
+        app_bundles: &[],
         skill_rel: ".agents/skills/caisson/SKILL.md",
     },
 ];
@@ -123,16 +155,50 @@ fn lookup_user_home(username: &str) -> Option<PathBuf> {
 
 fn find_spec(id: &str) -> Result<&'static AgentSpec> {
     let lower = id.trim().to_ascii_lowercase();
-    KNOWN_AGENTS.iter().find(|s| s.id == lower).ok_or_else(|| {
-        let valid = KNOWN_AGENTS
-            .iter()
-            .map(|s| s.id)
-            .collect::<Vec<_>>()
-            .join(", ");
-        CaissonError::Message(format!(
-            "unknown agent harness '{id}'; supported values: {valid}"
-        ))
-    })
+    KNOWN_AGENTS
+        .iter()
+        .find(|s| s.id == lower || s.aliases.iter().any(|a| *a == lower))
+        .ok_or_else(|| {
+            let valid = KNOWN_AGENTS
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+                .join(", ");
+            CaissonError::Message(format!(
+                "unknown agent harness '{id}'; supported values: {valid} (aliases: agy, claude-code)"
+            ))
+        })
+}
+
+fn find_in_path(bin_name: &str) -> bool {
+    let Ok(path_var) = std::env::var("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| dir.join(bin_name).is_file())
+}
+
+fn detect_agent(home: &Path, spec: &AgentSpec) -> bool {
+    if home.join(spec.detect_rel).exists() {
+        return true;
+    }
+    if spec.home_bins.iter().any(|rel| home.join(rel).is_file()) {
+        return true;
+    }
+    // Only probe global PATH and /Applications when operating against the real user home
+    // (never when `CAISSON_HOME` is overridden in isolated tests).
+    let isolated_home = std::env::var("CAISSON_HOME")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+        || cfg!(test);
+    if !isolated_home {
+        if spec.path_bins.iter().any(|bin| find_in_path(bin)) {
+            return true;
+        }
+        if spec.app_bundles.iter().any(|app| Path::new(app).exists()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Inspect detection, skill installation, and dismissal state for all known coding agents.
@@ -142,7 +208,7 @@ pub fn inspect_agents(home: &Path, config: &CaissonConfig) -> Vec<AgentHarnessSt
         .map(|spec| {
             let detect_path = home.join(spec.detect_rel);
             let skill_path = home.join(spec.skill_rel);
-            let detected = detect_path.exists();
+            let detected = detect_agent(home, spec);
             let installed = skill_path.is_file();
             let dismissed = config
                 .agents
@@ -182,13 +248,13 @@ pub fn install_agent_skills(
     } else if all_detected {
         KNOWN_AGENTS
             .iter()
-            .filter(|s| home.join(s.detect_rel).exists())
+            .filter(|s| detect_agent(home, s))
             .collect()
     } else {
         KNOWN_AGENTS
             .iter()
             .filter(|s| {
-                home.join(s.detect_rel).exists()
+                detect_agent(home, s)
                     && !config
                         .agents
                         .dismissed
@@ -232,7 +298,7 @@ pub fn install_agent_skills(
         affected.push(AgentHarnessStatus {
             id: spec.id.to_string(),
             display_name: spec.display_name.to_string(),
-            detected: home.join(spec.detect_rel).exists(),
+            detected: detect_agent(home, spec),
             installed: if dry_run { skill_path.is_file() } else { true },
             dismissed: false,
             detect_path: home.join(spec.detect_rel).display().to_string(),
@@ -573,6 +639,26 @@ mod tests {
         // Uninstall claude removes the skill file
         uninstall_agent_skills(home, &mut cfg, &["claude".to_string()], false, false).unwrap();
         assert!(!home.join(".claude/skills/caisson/SKILL.md").exists());
+    }
+
+    #[test]
+    fn detects_agy_binary_and_installs_to_gemini_config_skills() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        fs::create_dir_all(home.join(".local/bin")).unwrap();
+        fs::write(home.join(".local/bin/agy"), "#!/bin/sh\n").unwrap();
+
+        let mut cfg = CaissonConfig::default();
+        let unconfigured = find_unconfigured_agents(home, &cfg);
+        assert_eq!(unconfigured.len(), 1);
+        assert_eq!(unconfigured[0].id, "antigravity");
+
+        // `agy` alias resolves to `antigravity` and writes `~/.gemini/config/skills/caisson/SKILL.md`.
+        install_agent_skills(home, &mut cfg, &["agy".to_string()], false, false).unwrap();
+        assert!(home
+            .join(".gemini/config/skills/caisson/SKILL.md")
+            .is_file());
+        assert!(find_unconfigured_agents(home, &cfg).is_empty());
     }
 
     #[test]
