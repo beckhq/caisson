@@ -377,7 +377,8 @@ pub fn run_doctor(registry_path: &Path, config: &CaissonConfig) -> Result<Doctor
         });
     }
 
-    if let Some(t3_warning) = detect_unshielded_t3_worktrees(&resolve_user_home()) {
+    if let Some(t3_warning) = detect_unshielded_t3_worktrees(&resolve_user_home(), &caisson_volumes)
+    {
         warnings.push(t3_warning);
     }
 
@@ -427,25 +428,69 @@ pub fn run_doctor(registry_path: &Path, config: &CaissonConfig) -> Result<Doctor
     })
 }
 
-/// Emit an informational finding if T3 Code's `~/.t3/worktrees` directory exists and sits on `/`.
-pub fn detect_unshielded_t3_worktrees(home: &Path) -> Option<DoctorWarning> {
-    let t3_dir = home.join(".t3").join("worktrees");
-    if !t3_dir.exists() {
+/// Resolve T3 Code's configured `worktreesDirectory` from `~/.t3/userdata/settings.json`,
+/// falling back to `~/.t3/worktrees` when T3 Code is installed without an explicit override.
+pub fn resolve_t3_worktrees_dir(home: &Path) -> Option<std::path::PathBuf> {
+    let settings_path = home.join(".t3").join("userdata").join("settings.json");
+    if let Ok(raw) = fs::read_to_string(&settings_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(dir) = val
+                .get("worktreesDirectory")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let expanded = if let Some(rest) = dir.strip_prefix("~/") {
+                    home.join(rest)
+                } else {
+                    std::path::PathBuf::from(dir)
+                };
+                return Some(expanded);
+            }
+        }
+        return Some(home.join(".t3").join("worktrees"));
+    }
+    let default_dir = home.join(".t3").join("worktrees");
+    if default_dir.exists() {
+        Some(default_dir)
+    } else {
+        None
+    }
+}
+
+/// Emit an informational finding if T3 Code's active worktrees directory does not reside on a
+/// Caisson-shielded APFS volume.
+pub fn detect_unshielded_t3_worktrees(
+    home: &Path,
+    caisson_volumes: &[VolumeShieldAudit],
+) -> Option<DoctorWarning> {
+    let t3_dir = resolve_t3_worktrees_dir(home)?;
+    let resolved = fs::canonicalize(&t3_dir).unwrap_or_else(|_| t3_dir.clone());
+
+    let on_caisson_volume = caisson_volumes.iter().any(|v| {
+        let mp = Path::new(&v.mount_point);
+        mp.exists() && same_volume(&resolved, mp).unwrap_or(false)
+    });
+    if on_caisson_volume {
         return None;
     }
-    let resolved = fs::canonicalize(&t3_dir).unwrap_or_else(|_| t3_dir.clone());
-    if same_volume(&resolved, Path::new("/")).unwrap_or(false) {
-        return Some(DoctorWarning {
-            code: "UNSHIELDED_T3_WORKTREES".to_string(),
-            severity: "info".to_string(),
-            message: format!(
-                "T3 Code worktrees directory ({}) resides on the unshielded root volume /",
-                t3_dir.display()
-            ),
-            remediation: "Mount a dedicated shielded APFS volume at ~/.t3/worktrees (`sudo caisson vol create t3-worktrees --mount ~/.t3/worktrees --nobrowse`), then add `caisson wt hydrate` as a T3 project setup script (`runOnWorktreeCreate`).".to_string(),
-        });
-    }
-    None
+
+    let on_root = same_volume(&resolved, Path::new("/")).unwrap_or(false);
+    let vol_desc = if on_root {
+        "the unshielded root volume /"
+    } else {
+        "an unshielded volume (not managed by Caisson)"
+    };
+
+    Some(DoctorWarning {
+        code: "UNSHIELDED_T3_WORKTREES".to_string(),
+        severity: "info".to_string(),
+        message: format!(
+            "T3 Code worktrees directory ({}) resides on {vol_desc}",
+            t3_dir.display()
+        ),
+        remediation: "Point T3 Code's `worktreesDirectory` setting (Settings or ~/.t3/userdata/settings.json) to `/Volumes/caisson/t3-worktrees`, and add `caisson wt hydrate` as a project setup script (`runOnWorktreeCreate`).".to_string(),
+    })
 }
 
 /// Render a crisp human-readable terminal summary of `DoctorReport`.
@@ -621,15 +666,34 @@ mod tests {
     }
 
     #[test]
-    fn detects_unshielded_t3_worktrees_only_when_present_on_root_volume() {
+    fn detects_unshielded_t3_worktrees_and_reads_settings_override() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(detect_unshielded_t3_worktrees(dir.path()).is_none());
+        assert!(detect_unshielded_t3_worktrees(dir.path(), &[]).is_none());
 
         fs::create_dir_all(dir.path().join(".t3/worktrees")).unwrap();
-        // `tempdir()` resides on `/` (same volume as root), so it should emit the info finding.
-        let finding = detect_unshielded_t3_worktrees(dir.path()).unwrap();
+        let finding = detect_unshielded_t3_worktrees(dir.path(), &[]).unwrap();
         assert_eq!(finding.code, "UNSHIELDED_T3_WORKTREES");
         assert_eq!(finding.severity, "info");
+        assert!(finding.remediation.contains("worktreesDirectory"));
         assert!(finding.remediation.contains("caisson wt hydrate"));
+
+        // Explicit `worktreesDirectory` in settings.json overrides the default path.
+        let custom = dir.path().join("custom-t3-wt");
+        fs::create_dir_all(&custom).unwrap();
+        fs::create_dir_all(dir.path().join(".t3/userdata")).unwrap();
+        fs::write(
+            dir.path().join(".t3/userdata/settings.json"),
+            format!(r#"{{"worktreesDirectory": "{}"}}"#, custom.display()),
+        )
+        .unwrap();
+        assert_eq!(resolve_t3_worktrees_dir(dir.path()), Some(custom.clone()));
+
+        // When the configured dir resides on a registered Caisson volume, no warning is emitted.
+        let fake_vol = VolumeShieldAudit {
+            name: "caisson".to_string(),
+            mount_point: custom.display().to_string(),
+            shields: inspect_shields(&custom),
+        };
+        assert!(detect_unshielded_t3_worktrees(dir.path(), &[fake_vol]).is_none());
     }
 }
