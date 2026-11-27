@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Platform: macOS APFS](https://img.shields.io/badge/platform-macOS%20APFS-black.svg)](#why-sibling-apfs-volumes)
 
-> **Windows Dev Drive for macOS — purpose-built for parallel AI coding agents and heavyweight native builds.**
+> **The native macOS APFS workspace engine — purpose-built for parallel AI coding agents and heavyweight builds.**
 >
 > Born while building the **Refactor** browser at [BeckHQ](https://github.com/beckhq), where running dozens of parallel coding agents alongside multi-gigabyte Chromium builds pushed macOS Spotlight (`mds_stores`), `fseventsd`, Time Machine local snapshots, and `rm -rf` teardown storms past their breaking point.
 

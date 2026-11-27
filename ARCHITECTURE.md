@@ -1,6 +1,6 @@
 # Caisson Architecture
 
-**Caisson** is a fast, native macOS CLI written in Rust that gives developers and multi-agent coding workflows isolated, daemon-shielded APFS workspaces—a macOS equivalent to Windows Dev Drive with first-class Copy-on-Write worktree management.
+**Caisson** is a fast, native macOS CLI written in Rust that gives developers and multi-agent coding workflows isolated, daemon-shielded APFS workspaces with first-class Copy-on-Write git worktree management.
 
 ---
 
