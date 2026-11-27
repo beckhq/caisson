@@ -376,6 +376,13 @@ pub fn run_doctor(registry_path: &Path, config: &CaissonConfig) -> Result<Doctor
 
     for vol in &caisson_volumes {
         if !vol.shields.all_healthy {
+            let fsevents_label = if vol.shields.fseventsd_no_log {
+                "true"
+            } else if vol.shields.fseventsd_no_log_unverified {
+                "root-only"
+            } else {
+                "false"
+            };
             warnings.push(DoctorWarning {
                 code: "DEGRADED_SHIELDS".to_string(),
                 severity: "warn".to_string(),
@@ -385,7 +392,7 @@ pub fn run_doctor(registry_path: &Path, config: &CaissonConfig) -> Result<Doctor
                     vol.mount_point,
                     vol.shields.noatime,
                     vol.shields.spotlight_disabled,
-                    vol.shields.fseventsd_no_log,
+                    fsevents_label,
                     vol.shields.tm_excluded
                 ),
                 remediation: format!("Re-apply shields with `sudo caisson vol shield {}`.", vol.name),
@@ -489,6 +496,13 @@ pub fn format_doctor_human(report: &DoctorReport) -> String {
             } else {
                 "DEGRADED"
             };
+            let fsevents_label = if v.shields.fseventsd_no_log {
+                "true"
+            } else if v.shields.fseventsd_no_log_unverified {
+                "root-only"
+            } else {
+                "false"
+            };
             out.push_str(&format!(
                 "  {:<18} {} [{}] (noatime={}, spotlight_off={}, fseventsd_no_log={}, tm_excluded={})\n",
                 v.name,
@@ -496,7 +510,7 @@ pub fn format_doctor_human(report: &DoctorReport) -> String {
                 state,
                 v.shields.noatime,
                 v.shields.spotlight_disabled,
-                v.shields.fseventsd_no_log,
+                fsevents_label,
                 v.shields.tm_excluded
             ));
         }

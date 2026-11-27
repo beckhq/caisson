@@ -74,7 +74,7 @@ impl VolumeMarker {
             libc::openat(
                 dir_fd.as_raw_fd(),
                 c_name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
             )
         };
         if raw_fd < 0 {
@@ -127,7 +127,12 @@ impl VolumeMarker {
             libc::openat(
                 dir_fd.as_raw_fd(),
                 c_name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_TRUNC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
                 0o644 as libc::c_uint,
             )
         };

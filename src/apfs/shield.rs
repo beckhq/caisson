@@ -29,6 +29,9 @@ pub struct ShieldStatus {
     pub mounted: bool,
     pub metadata_never_index: bool,
     pub fseventsd_no_log: bool,
+    /// True when `.fseventsd` exists with root-only `0700` permissions and cannot be traversed
+    /// by an unprivileged user (does not mark shields as degraded).
+    pub fseventsd_no_log_unverified: bool,
     pub trashes_blocked: bool,
     pub noatime: bool,
     pub nobrowse: bool,
@@ -329,7 +332,7 @@ fn write_readonly_marker_at(dir_fd: &OwnedFd, name: &str) -> Result<()> {
         libc::openat(
             dir_fd.as_raw_fd(),
             c_name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
             0o644 as libc::c_uint,
         )
     };
@@ -374,12 +377,16 @@ fn ensure_fseventsd_no_log_at(root_fd: &OwnedFd) -> Result<()> {
         ))
     })?;
 
+    // Allow unprivileged `stat(".fseventsd/no_log")` via execute/search bit (`0711`) while
+    // keeping `.fseventsd` non-listable and root-only writable.
+    let _ = unsafe { libc::fchmod(fs_fd.as_raw_fd(), 0o711) };
+
     let c_nolog = CString::new("no_log").unwrap();
     let raw_fd = unsafe {
         libc::openat(
             fs_fd.as_raw_fd(),
             c_nolog.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
             0o644 as libc::c_uint,
         )
     };
@@ -562,6 +569,7 @@ pub fn inspect_shields(mount_point: &Path) -> ShieldStatus {
             mounted: false,
             metadata_never_index: false,
             fseventsd_no_log: false,
+            fseventsd_no_log_unverified: false,
             trashes_blocked: false,
             noatime: false,
             nobrowse: false,
@@ -574,12 +582,18 @@ pub fn inspect_shields(mount_point: &Path) -> ShieldStatus {
     let metadata_never_index = fs::symlink_metadata(mount_point.join(".metadata_never_index"))
         .map(|m| m.is_file())
         .unwrap_or(false);
-    let fseventsd_no_log = fs::symlink_metadata(mount_point.join(".fseventsd"))
+    let fseventsd_is_dir = fs::symlink_metadata(mount_point.join(".fseventsd"))
         .map(|m| m.is_dir())
-        .unwrap_or(false)
-        && fs::symlink_metadata(mount_point.join(".fseventsd").join("no_log"))
-            .map(|m| m.is_file())
-            .unwrap_or(false);
+        .unwrap_or(false);
+    let (fseventsd_no_log, fseventsd_no_log_unverified) = if !fseventsd_is_dir {
+        (false, false)
+    } else {
+        match fs::symlink_metadata(mount_point.join(".fseventsd").join("no_log")) {
+            Ok(m) => (m.is_file(), false),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (false, true),
+            Err(_) => (false, false),
+        }
+    };
     let trashes_blocked = fs::symlink_metadata(mount_point.join(".Trashes"))
         .map(|m| m.is_file() && m.len() == 0)
         .unwrap_or(false);
@@ -603,8 +617,9 @@ pub fn inspect_shields(mount_point: &Path) -> ShieldStatus {
         .map(|o| parse_tmutil_excluded(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or(false);
 
+    let fseventsd_ok = fseventsd_no_log || fseventsd_no_log_unverified;
     let all_healthy = metadata_never_index
-        && fseventsd_no_log
+        && fseventsd_ok
         && trashes_blocked
         && noatime
         && spotlight_disabled
@@ -615,6 +630,7 @@ pub fn inspect_shields(mount_point: &Path) -> ShieldStatus {
         mounted: true,
         metadata_never_index,
         fseventsd_no_log,
+        fseventsd_no_log_unverified,
         trashes_blocked,
         noatime,
         nobrowse,
@@ -745,6 +761,22 @@ mod tests {
         let after = inspect_shields(dir.path());
         assert!(after.metadata_never_index);
         assert!(after.fseventsd_no_log);
+        assert!(!after.fseventsd_no_log_unverified);
         assert!(after.trashes_blocked);
+
+        // Simulate macOS's root-only 0700 `.fseventsd` (untraversable by non-root -> PermissionDenied).
+        let locked_dir = tempdir().unwrap();
+        let fs_dir = locked_dir.path().join(".fseventsd");
+        fs::create_dir_all(&fs_dir).unwrap();
+        fs::write(fs_dir.join("no_log"), b"").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fs_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let locked_status = inspect_shields(locked_dir.path());
+        // Restore perms so tempdir cleans up cleanly.
+        let _ = fs::set_permissions(&fs_dir, fs::Permissions::from_mode(0o755));
+        if !crate::apfs::statfs::is_root() {
+            assert!(!locked_status.fseventsd_no_log);
+            assert!(locked_status.fseventsd_no_log_unverified);
+        }
     }
 }
