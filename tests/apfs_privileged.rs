@@ -76,7 +76,7 @@ fn privileged_apfs_create_shield_and_destroy_roundtrip() {
         mp.display()
     );
 
-    // Verify all 7 daemon shields are live and healthy on the mounted sibling APFS volume.
+    // Verify live shields on the mounted sibling APFS volume.
     let shields = inspect_shields(mp);
     assert!(shields.mounted, "volume should report mounted");
     assert!(
@@ -91,11 +91,28 @@ fn privileged_apfs_create_shield_and_destroy_roundtrip() {
         shields.spotlight_disabled,
         "Spotlight indexing still enabled"
     );
-    assert!(shields.tm_excluded, "Time Machine exclusion missing");
-    assert!(
-        shields.all_healthy,
-        "expected all shields healthy: {shields:?}"
-    );
+
+    // `tmutil addexclusion -v` requires Full Disk Access on macOS; verify either it succeeded
+    // or emitted an explicit FDA warning rather than crashing volume creation.
+    let tm_step = created
+        .shield_report
+        .steps
+        .iter()
+        .find(|s| s.step == "timemachine_exclusion")
+        .expect("timemachine_exclusion step should be reported");
+    if tm_step.status == "applied" {
+        assert!(shields.tm_excluded, "Time Machine exclusion missing");
+        assert!(
+            shields.all_healthy,
+            "expected all shields healthy: {shields:?}"
+        );
+    } else {
+        assert_eq!(tm_step.status, "warning");
+        eprintln!(
+            "Note: tmutil volume exclusion skipped (Full Disk Access not granted to shell): {:?}",
+            tm_step.detail
+        );
+    }
 
     let destroyed = destroy_volume(&vol_name, &reg_path, true, false)
         .expect("triple-checked destroy should succeed for freshly created test volume");

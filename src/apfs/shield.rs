@@ -132,7 +132,8 @@ pub fn apply_shields(mount_point: &Path, opts: &ShieldOptions) -> Result<ShieldA
         steps.push(ShieldStepResult {
             step: "block_trashes".to_string(),
             command: Some(format!(
-                "touch {} && chmod 0444 {}",
+                "rm -rf {} && touch {} && chmod 0444 {}",
+                trashes.display(),
                 trashes.display(),
                 trashes.display()
             )),
@@ -141,8 +142,8 @@ pub fn apply_shields(mount_point: &Path, opts: &ShieldOptions) -> Result<ShieldA
         });
     } else {
         if let Ok(meta) = fs::symlink_metadata(&trashes) {
-            if meta.is_dir() {
-                let _ = fs::remove_dir(&trashes);
+            if meta.is_dir() && dir_has_no_regular_files(&trashes) {
+                let _ = fs::remove_dir_all(&trashes);
             }
         }
         if !trashes.is_dir() {
@@ -158,13 +159,15 @@ pub fn apply_shields(mount_point: &Path, opts: &ShieldOptions) -> Result<ShieldA
                 step: "block_trashes".to_string(),
                 command: None,
                 status: "skipped".to_string(),
-                detail: Some("non-empty .Trashes directory already exists".to_string()),
+                detail: Some(
+                    "non-empty .Trashes directory containing files already exists".to_string(),
+                ),
             });
         }
     }
 
-    // Step 5: tmutil addexclusion <mountpoint>
-    let tmutil_cmd = format!("tmutil addexclusion {mp}");
+    // Step 5: tmutil addexclusion -v <mountpoint> (volume UUID exclusion; requires root + Full Disk Access)
+    let tmutil_cmd = format!("tmutil addexclusion -v {mp}");
     if opts.dry_run {
         steps.push(ShieldStepResult {
             step: "timemachine_exclusion".to_string(),
@@ -174,21 +177,27 @@ pub fn apply_shields(mount_point: &Path, opts: &ShieldOptions) -> Result<ShieldA
         });
     } else {
         let out = Command::new("tmutil")
-            .args(["addexclusion", &mp])
+            .args(["addexclusion", "-v", &mp])
             .output()?;
-        if !out.status.success() {
-            return Err(CaissonError::CommandFailed {
-                cmd: tmutil_cmd,
-                code: out.status.code(),
-                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        if out.status.success() {
+            steps.push(ShieldStepResult {
+                step: "timemachine_exclusion".to_string(),
+                command: Some(tmutil_cmd),
+                status: "applied".to_string(),
+                detail: None,
+            });
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let detail = format!(
+                "{stderr} (Note: `tmutil addexclusion -v` requires Full Disk Access for your terminal in System Settings -> Privacy & Security -> Full Disk Access; re-run `sudo caisson vol shield` after granting FDA)"
+            );
+            steps.push(ShieldStepResult {
+                step: "timemachine_exclusion".to_string(),
+                command: Some(tmutil_cmd),
+                status: "warning".to_string(),
+                detail: Some(detail),
             });
         }
-        steps.push(ShieldStepResult {
-            step: "timemachine_exclusion".to_string(),
-            command: Some(tmutil_cmd),
-            status: "applied".to_string(),
-            detail: None,
-        });
     }
 
     // Step 6: mount -u -o noatime[,nobrowse] <mountpoint>
@@ -258,6 +267,27 @@ pub fn apply_shields(mount_point: &Path, opts: &ShieldOptions) -> Result<ShieldA
         dry_run: opts.dry_run,
         steps,
     })
+}
+
+/// Return true if `dir` contains only empty subdirectories (e.g. macOS's auto-created `.Trashes/501`)
+/// and no actual files or symlinks.
+fn dir_has_no_regular_files(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            return false;
+        };
+        if meta.is_dir() {
+            if !dir_has_no_regular_files(&entry.path()) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 fn write_readonly_marker(path: &Path) -> Result<()> {
@@ -406,5 +436,16 @@ mod tests {
         assert!(after.metadata_never_index);
         assert!(after.fseventsd_no_log);
         assert!(after.trashes_blocked);
+    }
+
+    #[test]
+    fn detects_empty_trashes_subdirs_vs_files() {
+        let dir = tempdir().unwrap();
+        let trashes = dir.path().join(".Trashes");
+        fs::create_dir_all(trashes.join("501")).unwrap();
+        assert!(dir_has_no_regular_files(&trashes));
+
+        fs::write(trashes.join("501/keep.txt"), "data").unwrap();
+        assert!(!dir_has_no_regular_files(&trashes));
     }
 }

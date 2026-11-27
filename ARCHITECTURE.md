@@ -98,7 +98,7 @@ Every Caisson-managed volume receives the following idempotent shield stack (`ca
 2. `<mountpoint>/.metadata_never_index` (mode `0444`) — belt-and-suspenders Spotlight marker.
 3. `<mountpoint>/.fseventsd/no_log` — disables persistent `fseventsd` disk log files on the volume.
 4. `<mountpoint>/.Trashes` (0-byte file, mode `0444`) — prevents Finder trash directory creation.
-5. `tmutil addexclusion <mountpoint>` — excludes the volume from Time Machine backups and local snapshots.
+5. `tmutil addexclusion -v <mountpoint>` — excludes the volume by APFS UUID from Time Machine backups and local snapshots (requires Full Disk Access for the invoking terminal; gracefully warns if FDA is not granted).
 6. `mount -u -o noatime[,nobrowse] <mountpoint>` — eliminates access-time writes on read-heavy compile/stat storms (and optional Finder/LaunchServices hiding).
 7. `chown <invoking-user>:staff <mountpoint>` — hands full unprivileged ownership to the developer.
 

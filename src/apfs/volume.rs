@@ -251,8 +251,12 @@ pub fn create_volume(
         created_at: Utc::now(),
     };
 
-    // Write on-volume ownership marker `.caisson-volume.json`
+    // Write on-volume ownership marker `.caisson-volume.json` and register immediately so even
+    // if a subsequent shield step warns or fails, the volume is tracked and cleanly removable.
     VolumeMarker::from_registered(&registered).write_to(&actual_mount)?;
+    let mut registry = VolumeRegistry::load_from(registry_path)?;
+    registry.upsert(registered);
+    registry.save_to(registry_path)?;
 
     // Initialize Tier-1 directories (`worktrees/`, `cache/`, `.trash/`)
     let mut created_dirs = Vec::new();
@@ -277,10 +281,6 @@ pub fn create_volume(
             dry_run: false,
         },
     )?;
-
-    let mut registry = VolumeRegistry::load_from(registry_path)?;
-    registry.upsert(registered);
-    registry.save_to(registry_path)?;
 
     Ok(VolumeCreateReport {
         name: opts.name.clone(),
