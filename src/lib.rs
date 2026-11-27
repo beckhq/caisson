@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod error;
 pub mod registry;
+pub mod t3;
 pub mod units;
 pub mod watch;
 pub mod worktree;

@@ -198,7 +198,8 @@ caisson config set quotas.soft_disk_limit 400G
 | Command | Purpose |
 | :--- | :--- |
 | `caisson wt add <branch> [--from <ref>] [--name <slug>] [--no-cow] [--force]` | Create a shielded CoW git worktree on `/Volumes/caisson` |
-| `caisson wt hydrate [--dry-run] [--no-post-create]` | APFS CoW-clone `.caisson.toml` `cow_copy` paths into any existing worktree (T3 Code / IDE hook) |
+| `caisson wt hydrate [--dry-run] [--no-post-create]` | Zero-config APFS CoW hydration (`node_modules`/`.venv` or `.caisson.toml`) with lockfile matching |
+| `caisson t3 setup [--volume <name>] [--dry-run]` | Guided T3 Code Worktree location setup (`~/.t3/userdata/settings.json` with backup) |
 | `caisson wt ls [--all]` | List worktrees with idle age, dirty/unpushed flags, and size |
 | `caisson wt path <target>` | Print canonical path of a worktree (powers `wt cd`) |
 | `caisson wt rm <target> [--force] [--sync]` | Instant `<1 ms` atomic rename to `.trash/` + async unlink |
@@ -248,8 +249,8 @@ During interactive `sudo caisson init`, Caisson detects your installed coding ag
 ### T3 Code & External Worktree Managers
 
 For host-managed worktree tools like **T3 Code**:
-1. Point T3 Code's **Worktree location** setting (`worktreesDirectory` in Settings -> Worktrees) to `/Volumes/caisson/t3-worktrees` (or a shielded volume on an external Thunderbolt/USB4 APFS SSD created via `sudo caisson vol create <name> --on /Volumes/<ssd> --nobrowse`).
-2. Add `caisson wt hydrate` as a project setup script (`runOnWorktreeCreate`) alongside a repo `.caisson.toml` with `cow_copy = ["node_modules"]`. Every new thread automatically CoW-clones dependencies from sibling worktrees on the same APFS volume.
+1. Run `caisson t3 setup --dry-run` (or open **T3 Code -> Settings -> Worktrees -> Worktree location** and point it to `/Volumes/<your-caisson-volume>/t3-worktrees`).
+2. *(Optional, for Node/Python repos)* Open **Project Settings -> Scripts**, add `caisson wt hydrate`, and enable **"Run when creating a worktree"**. No `.caisson.toml` is required for standard `node_modules` / `.venv` repos, and Caisson matches lockfiles (`pnpm-lock.yaml`, `package-lock.json`, `uv.lock`, etc.) automatically so agents know whether they can skip `pnpm install` completely.
 3. Run `sudo caisson daemon install` once; `dev.caisson.mount` uses `RunAtLoad` + `StartOnMount` so shields and `noatime` persist across reboots and external SSD reconnects.
 
 ---

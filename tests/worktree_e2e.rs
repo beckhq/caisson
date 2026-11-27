@@ -839,3 +839,114 @@ post_create = "echo hydrated:$CAISSON_BRANCH > .hook-ran"
         "hydrated:t3/thread-2"
     );
 }
+
+#[test]
+fn wt_hydrate_zero_config_auto_detects_and_prefers_matching_lockfile_donor() {
+    let sandbox = tempdir().unwrap();
+    let repo_dir = sandbox.path().join("zero-cfg-node-app");
+    let external_wt_root = sandbox.path().join("t3-worktrees");
+    let caisson_root = sandbox.path().join("mock-caisson-vol");
+    let config_path = sandbox.path().join("config.toml");
+    fs::create_dir_all(&external_wt_root).unwrap();
+    fs::create_dir_all(&caisson_root).unwrap();
+
+    // No `.caisson.toml` at all: only `package.json` + `pnpm-lock.yaml`.
+    init_sample_repo(&repo_dir);
+    fs::write(repo_dir.join("package.json"), r#"{"name":"demo"}"#).unwrap();
+    fs::write(
+        repo_dir.join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\nv1\n",
+    )
+    .unwrap();
+    run_git(&repo_dir, &["add", "package.json", "pnpm-lock.yaml"]);
+    run_git(&repo_dir, &["commit", "-m", "add package manifest"]);
+
+    // Donor 1 has matching v1 lockfile; Donor 2 (newer) has a different v2 lockfile.
+    let wt_match = external_wt_root.join("donor-v1");
+    let wt_mismatch = external_wt_root.join("donor-v2");
+    let wt_target = external_wt_root.join("target-v1");
+    run_git(
+        &repo_dir,
+        &["worktree", "add", "-b", "b-v1", wt_match.to_str().unwrap()],
+    );
+    run_git(
+        &repo_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "b-v2",
+            wt_mismatch.to_str().unwrap(),
+        ],
+    );
+    run_git(
+        &repo_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "b-target",
+            wt_target.to_str().unwrap(),
+        ],
+    );
+
+    fs::create_dir_all(wt_match.join("node_modules/a")).unwrap();
+    fs::write(wt_match.join("node_modules/a/ver.txt"), "from-matching-v1").unwrap();
+
+    // Make donor-v2 newer AND with a different lockfile.
+    fs::write(
+        wt_mismatch.join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\nv2-different\n",
+    )
+    .unwrap();
+    fs::create_dir_all(wt_mismatch.join("node_modules/a")).unwrap();
+    fs::write(
+        wt_mismatch.join("node_modules/a/ver.txt"),
+        "from-mismatched-v2",
+    )
+    .unwrap();
+
+    // Hydrate target-v1 without `.caisson.toml`: must auto-detect `node_modules` AND pick donor-v1!
+    let out = run_caisson(
+        &wt_target,
+        &caisson_root,
+        &config_path,
+        &["wt", "hydrate", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "zero-config hydrate failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["auto_detected"], true);
+    assert_eq!(json["cow_clones"][0]["entry"], "node_modules");
+    assert_eq!(json["cow_clones"][0]["status"], "cloned");
+    assert_eq!(json["cow_clones"][0]["lockfile_match"], true);
+    assert_eq!(
+        fs::read_to_string(wt_target.join("node_modules/a/ver.txt")).unwrap(),
+        "from-matching-v1"
+    );
+
+    // Now test a worktree whose lockfile differs from ALL donors: still clones, reports lockfile_match=false.
+    let wt_v3 = external_wt_root.join("target-v3");
+    run_git(
+        &repo_dir,
+        &["worktree", "add", "-b", "b-v3", wt_v3.to_str().unwrap()],
+    );
+    fs::write(
+        wt_v3.join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\nv3-brand-new\n",
+    )
+    .unwrap();
+    let out3 = run_caisson(
+        &wt_v3,
+        &caisson_root,
+        &config_path,
+        &["wt", "hydrate", "--json"],
+    );
+    assert!(out3.status.success());
+    let json3: Value = serde_json::from_slice(&out3.stdout).unwrap();
+    assert_eq!(json3["cow_clones"][0]["status"], "cloned");
+    assert_eq!(json3["cow_clones"][0]["lockfile_match"], false);
+}

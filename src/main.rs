@@ -8,8 +8,8 @@ use caisson::apfs::volume::{
     CreateVolumeOptions, QuotaSpec,
 };
 use caisson::cli::{
-    AgentCommands, Cli, Commands, ConfigCommands, DaemonCommands, ShellKind, VolCommands,
-    WtCommands,
+    AgentCommands, Cli, Commands, ConfigCommands, DaemonCommands, ShellKind, T3Commands,
+    VolCommands, WtCommands,
 };
 use caisson::config::CaissonConfig;
 use caisson::daemon::launchd::{
@@ -18,6 +18,7 @@ use caisson::daemon::launchd::{
 use caisson::doctor::{format_doctor_human, run_doctor};
 use caisson::error::{CaissonError, Result};
 use caisson::registry::{VolumeRegistry, VolumeTier};
+use caisson::t3::{format_t3_next_steps, is_t3_installed, run_t3_setup, T3SetupOptions};
 use caisson::units::format_bytes;
 use caisson::watch::{run_watch, WatchOptions};
 use caisson::worktree::manager::{
@@ -148,19 +149,29 @@ fn dispatch(cli: Cli) -> Result<()> {
                         println!("    - [{}] {}", step.status, step.step);
                     }
                 }
-                if !dry_run && !no_agents {
+                if !dry_run {
                     let home = resolve_user_home();
-                    let mut cfg = CaissonConfig::load_from(&config_path)?;
-                    if let Some(agent_report) =
-                        prompt_interactive_agent_setup(&home, &config_path, &mut cfg)?
-                    {
-                        println!(
-                            "Installed Caisson skill for {} agent(s):",
-                            agent_report.targets.len()
-                        );
-                        for t in &agent_report.targets {
-                            println!("  - {} -> {}", t.id, t.skill_path);
+                    if !no_agents {
+                        let mut cfg = CaissonConfig::load_from(&config_path)?;
+                        if let Some(agent_report) =
+                            prompt_interactive_agent_setup(&home, &config_path, &mut cfg)?
+                        {
+                            println!(
+                                "Installed Caisson skill for {} agent(s):",
+                                agent_report.targets.len()
+                            );
+                            for t in &agent_report.targets {
+                                println!("  - {} -> {}", t.id, t.skill_path);
+                            }
                         }
+                    }
+                    if is_t3_installed(&home) {
+                        println!(
+                            "\n{}",
+                            format_t3_next_steps(
+                                &Path::new(&report.mount_point).join("t3-worktrees")
+                            )
+                        );
                     }
                 }
             }
@@ -210,6 +221,17 @@ fn dispatch(cli: Cli) -> Result<()> {
                     }
                     if let Some(ref uuid) = report.uuid {
                         println!("  uuid: {uuid}");
+                    }
+                    if !dry_run {
+                        let home = resolve_user_home();
+                        if is_t3_installed(&home) {
+                            println!(
+                                "\n{}",
+                                format_t3_next_steps(
+                                    &Path::new(&report.mount_point).join("t3-worktrees")
+                                )
+                            );
+                        }
                     }
                 }
             }
@@ -764,14 +786,19 @@ fn dispatch(cli: Cli) -> Result<()> {
                             );
                         } else {
                             for c in &report.cow_clones {
+                                let lf_note = match c.lockfile_match {
+                                    Some(true) => " (lockfile match)",
+                                    Some(false) => " (lockfile differs: run incremental install)",
+                                    None => "",
+                                };
                                 match c.status.as_str() {
                                     "cloned" => println!(
-                                        "{prefix}cow-cloned '{}' from {}",
+                                        "{prefix}cow-cloned '{}' from {}{lf_note}",
                                         c.entry,
                                         c.source.as_deref().unwrap_or("")
                                     ),
                                     "planned" => println!(
-                                        "{prefix}would cow-clone '{}' from {}",
+                                        "{prefix}would cow-clone '{}' from {}{lf_note}",
                                         c.entry,
                                         c.source.as_deref().unwrap_or("")
                                     ),
@@ -951,6 +978,55 @@ fn dispatch(cli: Cli) -> Result<()> {
                 }
             }
         }
+
+        Commands::T3 { action } => match action {
+            T3Commands::Setup {
+                volume,
+                path,
+                dry_run,
+                yes,
+            } => {
+                let home = resolve_user_home();
+                let report = run_t3_setup(
+                    &home,
+                    &registry_path,
+                    &T3SetupOptions {
+                        volume,
+                        path,
+                        dry_run,
+                        yes,
+                    },
+                )?;
+                if json {
+                    print_json(&report)?;
+                } else {
+                    let prefix = if report.dry_run { "[dry-run] " } else { "" };
+                    println!("{prefix}T3 Code settings: {}", report.settings_path);
+                    println!(
+                        "  Worktree location: {} -> {}",
+                        report
+                            .previous_worktrees_directory
+                            .as_deref()
+                            .unwrap_or("<default ~/.t3/worktrees>"),
+                        report.target_worktrees_directory
+                    );
+                    if !report.target_volume_shielded {
+                        println!(
+                            "  warning: target directory is not on a healthy shielded Caisson volume"
+                        );
+                    }
+                    if report.changed {
+                        if let Some(ref bak) = report.backup_path {
+                            println!("  backup saved: {bak}");
+                        }
+                        println!("Updated T3 Code Worktree location.");
+                    } else if !report.dry_run {
+                        println!("Already configured to this path; no changes made.");
+                    }
+                    println!("  next (Node/Python repos): {}", report.project_script_hint);
+                }
+            }
+        },
     }
 
     Ok(())

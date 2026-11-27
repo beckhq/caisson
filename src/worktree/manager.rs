@@ -1,4 +1,5 @@
 use crate::apfs::clonefile::clone_path;
+use crate::apfs::shield::inspect_shields;
 use crate::apfs::statfs::{same_volume, statfs_path};
 use crate::config::{CaissonConfig, RepoConfig};
 use crate::error::{CaissonError, Result};
@@ -38,6 +39,8 @@ pub struct CowCloneOutcome {
     pub source: Option<String>,
     pub status: String,
     pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lockfile_match: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -129,6 +132,8 @@ pub struct WtHydrateReport {
     pub worktree_path: String,
     pub branch: Option<String>,
     pub volume_mount: Option<String>,
+    pub volume_shielded: bool,
+    pub auto_detected: bool,
     pub dry_run: bool,
     pub cow_clones: Vec<CowCloneOutcome>,
     pub post_create_ran: bool,
@@ -577,6 +582,67 @@ fn cow_clone_entry(
     )
 }
 
+/// Known lockfiles associated with standard dependency directories.
+fn lockfiles_for_entry(entry: &str) -> &'static [&'static str] {
+    let trimmed = entry.trim_matches('/');
+    match trimmed {
+        "node_modules" => &[
+            "pnpm-lock.yaml",
+            "package-lock.json",
+            "yarn.lock",
+            "bun.lock",
+            "bun.lockb",
+            "npm-shrinkwrap.json",
+        ],
+        ".venv" | "venv" => &[
+            "uv.lock",
+            "poetry.lock",
+            "Pipfile.lock",
+            "pdm.lock",
+            "requirements.txt",
+        ],
+        _ => &[],
+    }
+}
+
+/// Compare lockfile contents between `donor_root` and `target_wt` for standard dependency entries.
+/// Returns `None` when the entry has no known lockfile present in `target_wt`, `Some(true)` on
+/// exact byte-for-byte match, and `Some(false)` if the donor's lockfile is missing or differs.
+fn check_lockfile_match(entry: &str, donor_root: &Path, target_wt: &Path) -> Option<bool> {
+    let lockfiles = lockfiles_for_entry(entry);
+    let target_lock = lockfiles
+        .iter()
+        .find(|&&name| target_wt.join(name).is_file())?;
+    let donor_path = donor_root.join(target_lock);
+    let target_path = target_wt.join(target_lock);
+    let Ok(d_meta) = fs::metadata(&donor_path) else {
+        return Some(false);
+    };
+    let Ok(t_meta) = fs::metadata(&target_path) else {
+        return None;
+    };
+    if d_meta.len() != t_meta.len() {
+        return Some(false);
+    }
+    match (fs::read(&donor_path), fs::read(&target_path)) {
+        (Ok(a), Ok(b)) => Some(a == b),
+        _ => Some(false),
+    }
+}
+
+/// Zero-config dependency auto-detection when a repository has no `.caisson.toml`.
+/// Strictly targets dependency directories (`node_modules`, `.venv`) and never build outputs.
+fn auto_detect_cow_entries(wt_root: &Path) -> Vec<String> {
+    let mut entries = Vec::new();
+    if wt_root.join("package.json").is_file() {
+        entries.push("node_modules".to_string());
+    }
+    if wt_root.join("pyproject.toml").is_file() || wt_root.join("requirements.txt").is_file() {
+        entries.push(".venv".to_string());
+    }
+    entries
+}
+
 fn cow_clone_from_candidates(
     candidate_roots: &[PathBuf],
     cross_volume_roots: &[PathBuf],
@@ -593,6 +659,7 @@ fn cow_clone_from_candidates(
                 source: None,
                 status: "skipped".to_string(),
                 detail: Some(e.to_string()),
+                lockfile_match: None,
             };
         }
     };
@@ -604,6 +671,7 @@ fn cow_clone_from_candidates(
             source: None,
             status: "skipped".to_string(),
             detail: Some(e.to_string()),
+            lockfile_match: None,
         };
     }
 
@@ -614,35 +682,48 @@ fn cow_clone_from_candidates(
             source: None,
             status: "skipped".to_string(),
             detail: Some("already exists in worktree".to_string()),
+            lockfile_match: None,
         };
     }
 
-    let donor = candidate_roots.iter().find_map(|root| {
-        if !root.is_dir() {
-            return None;
-        }
-        if !same_volume(root, target_wt).unwrap_or(false) {
-            return None;
-        }
-        let candidate = root.join(&rel);
-        if fs::symlink_metadata(&candidate).is_err() {
-            return None;
-        }
-        // Reject intermediate symlink traversal in donor root as well.
-        if let Some(rel_parent) = rel.parent() {
-            if !rel_parent.as_os_str().is_empty()
-                && ensure_no_symlink_escape(root, rel_parent).is_err()
-            {
+    // Collect valid same-volume donors in priority order, then prefer an exact lockfile match
+    // when available so agents can skip package-manager installs safely.
+    let valid_donors: Vec<(&PathBuf, PathBuf, Option<bool>)> = candidate_roots
+        .iter()
+        .filter_map(|root| {
+            if !root.is_dir() {
                 return None;
             }
-        }
-        if !same_volume(&candidate, target_wt).unwrap_or(false) {
-            return None;
-        }
-        Some(candidate)
-    });
+            if !same_volume(root, target_wt).unwrap_or(false) {
+                return None;
+            }
+            let candidate = root.join(&rel);
+            if fs::symlink_metadata(&candidate).is_err() {
+                return None;
+            }
+            // Reject intermediate symlink traversal in donor root as well.
+            if let Some(rel_parent) = rel.parent() {
+                if !rel_parent.as_os_str().is_empty()
+                    && ensure_no_symlink_escape(root, rel_parent).is_err()
+                {
+                    return None;
+                }
+            }
+            if !same_volume(&candidate, target_wt).unwrap_or(false) {
+                return None;
+            }
+            let lf_match = check_lockfile_match(entry, root, target_wt);
+            Some((root, candidate, lf_match))
+        })
+        .collect();
 
-    let Some(donor_path) = donor else {
+    let selected = valid_donors
+        .iter()
+        .find(|(_, _, lf)| *lf == Some(true))
+        .or_else(|| valid_donors.first())
+        .map(|(_, path, lf)| (path.clone(), *lf));
+
+    let Some((donor_path, lockfile_match)) = selected else {
         let cross_volume_exists = cross_volume_roots
             .iter()
             .any(|root| fs::symlink_metadata(root.join(&rel)).is_ok());
@@ -659,6 +740,7 @@ fn cow_clone_from_candidates(
             source: None,
             status: "skipped".to_string(),
             detail: Some(detail),
+            lockfile_match: None,
         };
     };
 
@@ -668,6 +750,7 @@ fn cow_clone_from_candidates(
             source: Some(donor_path.display().to_string()),
             status: "planned".to_string(),
             detail: None,
+            lockfile_match,
         };
     }
 
@@ -678,6 +761,7 @@ fn cow_clone_from_candidates(
                 source: Some(donor_path.display().to_string()),
                 status: "failed".to_string(),
                 detail: Some(e.to_string()),
+                lockfile_match,
             };
         }
         // Verify canonical destination parent stays strictly inside canonical target_wt.
@@ -687,6 +771,7 @@ fn cow_clone_from_candidates(
                 source: Some(donor_path.display().to_string()),
                 status: "failed".to_string(),
                 detail: Some("failed to canonicalize target worktree".to_string()),
+                lockfile_match,
             };
         };
         let Ok(canon_parent) = fs::canonicalize(parent) else {
@@ -695,6 +780,7 @@ fn cow_clone_from_candidates(
                 source: Some(donor_path.display().to_string()),
                 status: "failed".to_string(),
                 detail: Some("failed to canonicalize destination parent".to_string()),
+                lockfile_match,
             };
         };
         if !canon_parent.starts_with(&canon_wt) {
@@ -703,6 +789,7 @@ fn cow_clone_from_candidates(
                 source: Some(donor_path.display().to_string()),
                 status: "skipped".to_string(),
                 detail: Some("destination parent escapes worktree root".to_string()),
+                lockfile_match,
             };
         }
     }
@@ -713,19 +800,21 @@ fn cow_clone_from_candidates(
             source: Some(donor_path.display().to_string()),
             status: "cloned".to_string(),
             detail: None,
+            lockfile_match,
         },
         Err(e) => CowCloneOutcome {
             entry: entry.to_string(),
             source: Some(donor_path.display().to_string()),
             status: "failed".to_string(),
             detail: Some(e.to_string()),
+            lockfile_match,
         },
     }
 }
 
 /// Hydrate an existing git worktree (created by T3 Code, an IDE, or `git worktree add`)
-/// using `.caisson.toml` `cow_copy` entries via same-volume APFS `clonefile(2)` and optional
-/// `post_create` hook.
+/// using `.caisson.toml` `cow_copy` entries (or zero-config `node_modules` / `.venv` detection
+/// when `.caisson.toml` is absent) via same-volume APFS `clonefile(2)` and optional `post_create`.
 pub fn wt_hydrate(config: &CaissonConfig, opts: &WtHydrateOptions) -> Result<WtHydrateReport> {
     let start_dir = match opts.path {
         Some(ref p) => p.clone(),
@@ -736,18 +825,32 @@ pub fn wt_hydrate(config: &CaissonConfig, opts: &WtHydrateOptions) -> Result<WtH
     let branch = worktree_current_branch(&target_wt);
 
     // Prefer `.caisson.toml` from the target worktree if present (so branch edits apply),
-    // otherwise fall back to the primary repository root.
-    let repo_cfg = if target_wt.join(".caisson.toml").is_file() {
-        RepoConfig::load_from_repo(&target_wt)?
+    // then the primary repository root; if neither exists, safely auto-detect standard deps.
+    let (repo_cfg, has_explicit_cfg) = if target_wt.join(".caisson.toml").is_file() {
+        (RepoConfig::load_from_repo(&target_wt)?, true)
+    } else if repo.main_repo_root.join(".caisson.toml").is_file() {
+        (RepoConfig::load_from_repo(&repo.main_repo_root)?, true)
     } else {
-        RepoConfig::load_from_repo(&repo.main_repo_root)?
+        (RepoConfig::default(), false)
+    };
+
+    let (cow_entries, auto_detected) = if has_explicit_cfg {
+        (repo_cfg.worktree.cow_copy.clone(), false)
+    } else {
+        let detected = auto_detect_cow_entries(&target_wt);
+        let is_auto = !detected.is_empty();
+        (detected, is_auto)
     };
 
     let volume_mount = statfs_path(&target_wt).ok().map(|st| st.mount_point);
+    let volume_shielded = volume_mount
+        .as_deref()
+        .map(|mp| mp != "/" && inspect_shields(Path::new(mp)).all_healthy)
+        .unwrap_or(false);
     let caisson_root = config.resolve_root();
 
     // Build same-volume donor search order:
-    // 1. `<volume_mount>/.caisson-cache/<repo_id>` and `<repo_name>` (for dedicated volumes like ~/.t3/worktrees)
+    // 1. `<volume_mount>/.caisson-cache/<repo_id>` and `<repo_name>`
     // 2. `<caisson_root>/cache/<repo_id>` and `<repo_name>` (when on same volume)
     // 3. Other git worktrees of this repo on the same volume, ordered by newest activity first.
     let mut candidate_roots: Vec<PathBuf> = Vec::new();
@@ -798,7 +901,7 @@ pub fn wt_hydrate(config: &CaissonConfig, opts: &WtHydrateOptions) -> Result<WtH
     };
 
     let mut cow_clones = Vec::new();
-    for entry in &repo_cfg.worktree.cow_copy {
+    for entry in &cow_entries {
         cow_clones.push(cow_clone_from_candidates(
             &candidate_roots,
             &cross_volume_roots,
@@ -843,6 +946,8 @@ pub fn wt_hydrate(config: &CaissonConfig, opts: &WtHydrateOptions) -> Result<WtH
         worktree_path: target_wt.display().to_string(),
         branch,
         volume_mount,
+        volume_shielded,
+        auto_detected,
         dry_run: opts.dry_run,
         cow_clones,
         post_create_ran,

@@ -1,14 +1,36 @@
 ---
 name: caisson
-description: Use Caisson on macOS when you would otherwise run `git worktree add` yourself, to create, list, or remove worktrees on the daemon-shielded `/Volumes/caisson` APFS volume. Let the host manage worktrees when it owns them (T3 Code `workspaceStrategy`, Claude Code worktree isolation, or IDE worktree managers).
+description: Use Caisson on macOS when you would otherwise run `git worktree add` yourself, OR when entering a fresh git worktree with missing `node_modules` / `.venv` to hydrate dependencies instantaneously via APFS Copy-on-Write (`caisson wt hydrate`). Let the host manage worktrees when it owns them (T3 Code `workspaceStrategy`, Claude Code worktree isolation, or IDE worktree managers).
 ---
 
-# Caisson (macOS APFS Worktrees)
+# Caisson (macOS APFS Worktrees & CoW Hydration)
 
 ## When to Use
 
 - Use `caisson wt` when **you** would otherwise invoke `git worktree add` / `list` / `remove` directly on macOS.
-- **Do not route around host-managed worktrees.** If your host environment creates or binds a worktree for the thread (such as T3 Code `workspaceStrategy`, Claude Code worktree isolation, or an IDE worktree manager), let the host manage it.
+- **Do not route around host-managed worktrees.** If your host environment creates or binds a worktree for the thread (such as T3 Code `workspaceStrategy`, Claude Code worktree isolation, or an IDE worktree manager), let the host manage worktree creation and use `caisson wt hydrate` inside it.
+
+## Touchless Dependency Hydration in Fresh Worktrees (JS/TS & Python)
+
+Whenever you enter a git worktree on macOS and `node_modules/` or `.venv/` is missing, **run `caisson wt hydrate --json` BEFORE running `pnpm install`, `npm ci`, `bun install`, or `uv sync`**:
+
+```bash
+caisson wt hydrate --json
+```
+
+`caisson wt hydrate` is zero-`sudo`, idempotent, touches only the current worktree, and works even when `.caisson.toml` is absent (auto-detecting `node_modules` for `package.json` and `.venv` for `pyproject.toml`/`requirements.txt`, never build output directories).
+
+Handle its JSON output deterministically:
+- **`status: "cloned"` and `lockfile_match: true`:** Dependencies are an exact APFS CoW clone of a matching sibling worktree. **Skip the package-manager install completely.**
+- **`status: "cloned"` and `lockfile_match: false`:** 99% of packages are already cloned; run a fast incremental install (e.g. `pnpm install --offline` or `pnpm install`) to reconcile only the lockfile diff.
+- **`status: "skipped"`:** No same-volume donor exists yet (e.g. first worktree on this volume). Fall back to normal package install.
+
+## One-Time Proactive Setup Offer (Low-Noise)
+
+Do **not** interrupt coding tasks to pitch Caisson, and never run `sudo` or edit T3/IDE settings without explicit user consent.
+
+Only if `caisson wt hydrate --json` reports **`volume_shielded: false`** (or `caisson doctor` flags `UNSHIELDED_T3_WORKTREES`), offer **at most once per thread** (concisely, without blocking the user's task):
+- Ask whether the user wants to move future worktrees onto a shielded Caisson volume (`caisson t3 setup --dry-run` or `T3 Code -> Settings -> Worktrees -> Worktree location`) and/or wire `caisson wt hydrate` into the project's worktree setup script (`runOnWorktreeCreate`, which you can configure via `t3_project_update` if the user says yes in T3 Code).
 
 ## Preflight & Failure Cases
 

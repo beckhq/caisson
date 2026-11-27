@@ -174,6 +174,34 @@ pub enum Commands {
         #[command(subcommand)]
         action: AgentCommands,
     },
+
+    /// Guided T3 Code integration (configure Worktree location on a shielded Caisson volume).
+    T3 {
+        #[command(subcommand)]
+        action: T3Commands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum T3Commands {
+    /// Preview or update T3 Code's Worktree location (`~/.t3/userdata/settings.json`) to a shielded Caisson volume.
+    Setup {
+        /// Registered Caisson volume name to use (defaults to the healthy volume with the most free space).
+        #[arg(long)]
+        volume: Option<String>,
+
+        /// Explicit target directory path (overrides `--volume`).
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Preview planned changes without editing `~/.t3/userdata/settings.json`.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
