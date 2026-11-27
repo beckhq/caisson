@@ -43,7 +43,7 @@ Internal APFS Container (e.g. disk3)
 │   ├── .metadata_never_index    (Spotlight shield)
 │   ├── .fseventsd/no_log        (Disable fseventsd disk log persistence)
 │   ├── .Trashes                 (0-byte file blocking Finder trash creation)
-│   ├── worktrees/<repo>/<slug>/ (All `caisson wt` worktrees — NO sudo!)
+│   ├── worktrees/<repo>/<slug>/ (All `caisson wt` worktrees, NO sudo!)
 │   ├── cache/<repo>/            (Optional warm CoW templates for node_modules/deps)
 │   └── .trash/<uuid>/           (Atomic <1ms rename target for async unlink)
 │
@@ -58,7 +58,7 @@ Internal APFS Container (e.g. disk3)
 1. **Zero `sudo` for agents:** Only the one-time `sudo caisson init` requires root. Every `caisson wt add`, `rm`, `ls`, `prune`, `clone`, `doctor`, and `watch` runs completely unprivileged.
 2. **Same-volume `clonefile(2)` CoW:** `clonefile(2)` fails across different volumes (`EXDEV`). Keeping all worktrees of a repo on `/Volumes/caisson` enables instant, zero-disk-cost cloning of `node_modules`, `.venv`, or warm caches between worktrees.
 3. **No APFS volume-count ceiling:** Scales cleanly from 2 worktrees to hundreds without hitting APFS container volume limits.
-4. **Works from any existing repo:** `git worktree add` works seamlessly across volumes—users do not have to migrate `~/workspace` on day 1 to start using `caisson wt`.
+4. **Works from any existing repo:** `git worktree add` works seamlessly across volumes, so users do not have to migrate `~/workspace` on day 1 to start using `caisson wt`.
 
 ---
 
@@ -66,12 +66,12 @@ Internal APFS Container (e.g. disk3)
 
 APFS locks `-quota` and `-reserve` into the volume superblock **at creation time** (macOS provides no live resize verb for individual APFS volume quotas). Caisson therefore uses a **two-layer quota architecture**:
 
-### Layer A — Hard APFS Kernel Ceiling (Create-Time Blast Shield)
+### Layer A: Hard APFS Kernel Ceiling (Create-Time Blast Shield)
 Protects the host OS even from runaway compilers or infinite log loops that bypass the `caisson` CLI.
 * **Tier 1 (`caisson init`) default:** Auto-computed as `min(70% of container capacity, container capacity - 100 GiB)` (minimum `50 GiB`, or disabled if disk is too small unless specified). Override with `--quota <size>` or `--no-quota`.
 * **Tier 2 (`caisson vol create`) default:** Explicit `--quota <size>` encouraged (e.g., `--quota 250g`), since Tier-2 volumes are scoped to a single heavy workload and easily recreated.
 
-### Layer B — Live-Adjustable Soft Policy Quotas (Zero `sudo`, Anytime)
+### Layer B: Live-Adjustable Soft Policy Quotas (Zero `sudo`, Anytime)
 Stored in `~/.config/caisson/config.toml` and enforced instantaneously (via `statfs(2)` and git metadata checks) on `caisson wt add`:
 
 ```toml
@@ -94,17 +94,17 @@ When a soft quota is hit, `caisson wt add` exits with a structured error (and JS
 ## 4. Shield Stack & Boot Persistence
 
 Every Caisson-managed volume receives the following idempotent shield stack (`caisson create` / `caisson shield`):
-1. `mdutil -i off <mountpoint>` — disables Spotlight indexing at the volume level.
-2. `<mountpoint>/.metadata_never_index` (mode `0444`) — belt-and-suspenders Spotlight marker.
-3. `<mountpoint>/.fseventsd/no_log` — disables persistent `fseventsd` disk log files on the volume.
-4. `<mountpoint>/.Trashes` (0-byte file, mode `0444`) — prevents Finder trash directory creation.
-5. `tmutil addexclusion -v <mountpoint>` — excludes the volume by APFS UUID from Time Machine backups and local snapshots (requires Full Disk Access for the invoking terminal; gracefully warns if FDA is not granted).
-6. `mount -u -o noatime[,nobrowse] <mountpoint>` — eliminates access-time writes on read-heavy compile/stat storms (and optional Finder/LaunchServices hiding).
-7. `chown <invoking-user>:staff <mountpoint>` — hands full unprivileged ownership to the developer.
+1. `mdutil -i off <mountpoint>`: disables Spotlight indexing at the volume level.
+2. `<mountpoint>/.metadata_never_index` (mode `0444`): belt-and-suspenders Spotlight marker.
+3. `<mountpoint>/.fseventsd/no_log`: disables persistent `fseventsd` disk log files on the volume.
+4. `<mountpoint>/.Trashes` (0-byte file, mode `0444`): prevents Finder trash directory creation.
+5. `tmutil addexclusion -v <mountpoint>`: excludes the volume by APFS UUID from Time Machine backups and local snapshots (requires Full Disk Access for the invoking terminal; gracefully warns if FDA is not granted).
+6. `mount -u -o noatime[,nobrowse] <mountpoint>`: eliminates access-time writes on read-heavy compile/stat storms (and optional Finder/LaunchServices hiding).
+7. `chown <invoking-user>:staff <mountpoint>`: hands full unprivileged ownership to the developer.
 
 ### Reboot Persistence (`LaunchDaemon`)
 On modern macOS, `/etc/fstab` rejects `noatime` on secondary APFS volumes and breaks auto-mounting. `sudo caisson daemon install` writes a single auditable one-shot plist at `/Library/LaunchDaemons/dev.caisson.mount.plist`:
-* `RunAtLoad = true`, `KeepAlive = false` — runs `caisson mount-all` once at boot to re-apply `noatime` / `nobrowse` and verify shields, then exits immediately (**zero persistent background process, zero root socket attack surface**).
+* `RunAtLoad = true`, `KeepAlive = false`: runs `caisson mount-all` once at boot to re-apply `noatime` / `nobrowse` and verify shields, then exits immediately (**zero persistent background process, zero root socket attack surface**).
 
 ---
 
@@ -127,7 +127,7 @@ post_create = ""
   4. Prints the canonical path (or structured JSON with `--json`).
 * **`caisson wt rm <target> [--force]`**
   1. Verifies clean state unless `--force`.
-  2. Atomically renames the worktree directory into `/Volumes/caisson/.trash/<uuid>` (`rename(2)` — **<1 ms**).
+  2. Atomically renames the worktree directory into `/Volumes/caisson/.trash/<uuid>` (`rename(2)`, **<1 ms**).
   3. Runs `git worktree prune` to deregister the worktree immediately.
   4. Spawns a detached background worker (or cleans inline with `--sync`) to unlink `/Volumes/caisson/.trash/<uuid>`.
 * **`caisson wt prune [--inactive 7d] [--apply]`**

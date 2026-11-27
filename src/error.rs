@@ -33,7 +33,7 @@ pub enum CaissonError {
     #[error("invalid config value for '{key}': {reason}")]
     InvalidConfigValue { key: String, reason: String },
 
-    #[error("root privileges required for `{operation}` — re-run with `sudo caisson ...`")]
+    #[error("root privileges required for `{operation}`; re-run with `sudo caisson ...`")]
     RequiresRoot { operation: String },
 
     #[error("safety guard blocked destroy of '{volume}': {reason}")]

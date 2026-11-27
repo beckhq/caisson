@@ -263,7 +263,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 } else {
                     let prefix = if report.dry_run { "[dry-run] " } else { "" };
                     println!(
-                        "{prefix}Destroyed volume '{}' ({} / {}) — triple-check safety guard passed",
+                        "{prefix}Destroyed volume '{}' ({} / {}): triple-check safety guard passed",
                         report.name, report.uuid, report.device_identifier
                     );
                     if report.dry_run {
@@ -725,7 +725,7 @@ fn dispatch(cli: Cli) -> Result<()> {
 fn render_shell_init(shell: ShellKind, alias: Option<&str>) -> String {
     let mut script = match shell {
         ShellKind::Zsh | ShellKind::Bash => String::from(
-            r#"# Caisson shell integration — enables `caisson wt cd <target>`
+            r#"# Caisson shell integration: enables `caisson wt cd <target>`
 caisson() {
   if [ "$1" = "wt" ] && [ "$2" = "cd" ] && [ -n "$3" ]; then
     local target_dir
@@ -738,7 +738,7 @@ caisson() {
 "#,
         ),
         ShellKind::Fish => String::from(
-            r#"# Caisson shell integration — enables `caisson wt cd <target>`
+            r#"# Caisson shell integration: enables `caisson wt cd <target>`
 function caisson --wraps caisson
     if test (count $argv) -ge 3; and test "$argv[1]" = "wt"; and test "$argv[2]" = "cd"
         set -l target_dir (command caisson wt path "$argv[3]")

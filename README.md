@@ -1,14 +1,16 @@
 # Caisson
 
-**Daemon-shielded sibling APFS developer workspaces and instant Copy-on-Write git worktrees for macOS — written in Rust.**
+**Daemon-shielded sibling APFS developer workspaces and instant Copy-on-Write git worktrees for macOS, written in Rust.**
 
 [![CI](https://github.com/beckhq/caisson/actions/workflows/ci.yml/badge.svg)](https://github.com/beckhq/caisson/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![Platform: macOS APFS](https://img.shields.io/badge/platform-macOS%20APFS-black.svg)](#why-sibling-apfs-volumes)
+[![Platform: macOS APFS](https://img.shields.io/badge/platform-macOS%20APFS-black.svg)](#why-caisson)
 
-> **The native macOS APFS workspace engine — purpose-built for parallel AI coding agents and heavyweight builds.**
+> **The native macOS APFS workspace engine, purpose-built for parallel AI coding agents and heavyweight builds.**
 >
 > Born while building the **Refactor** browser at [BeckHQ](https://github.com/beckhq), where running dozens of parallel coding agents alongside multi-gigabyte Chromium builds pushed macOS Spotlight (`mds_stores`), `fseventsd`, Time Machine local snapshots, and `rm -rf` teardown storms past their breaking point.
+
+**Why "Caisson"?** In civil engineering, a *caisson* is a watertight retaining chamber sunk below water or soft ground so crews can construct foundations in dry, isolated conditions without fighting the surrounding pressure. Caisson does the same thing on macOS: it carves out a native, daemon-shielded APFS chamber inside your internal SSD so builds and coding agents run at full NVMe speed, isolated from Spotlight, `fseventsd`, and Time Machine pressure.
 
 ---
 
@@ -22,7 +24,7 @@ When you run parallel coding agents (`git worktree`) or heavy C++/Rust/Xcode/Chr
 4. **Slow teardown & worktree sprawl:** Deleting `node_modules` or build trees via `rm -rf` takes seconds to minutes and triggers a second `fseventsd` storm; forgotten agent worktrees accumulate silently.
 5. **External-drive TCC traps:** Moving builds to external Thunderbolt/USB drives triggers macOS *Removable Volumes* TCC prompts for freshly compiled ad-hoc test binaries.
 
-**Caisson solves all five at the APFS volume boundary** by creating a native **internal sibling APFS volume** (`/Volumes/caisson`) inside your Mac's internal APFS container—dynamically sharing free space with zero virtualization overhead, shielded from Spotlight, `fseventsd` disk logs, Time Machine, and `atime` churn.
+**Caisson solves all five at the APFS volume boundary** by creating a native **internal sibling APFS volume** (`/Volumes/caisson`) inside your Mac's internal APFS container. It dynamically shares free space with zero virtualization overhead, shielded from Spotlight, `fseventsd` disk logs, Time Machine, and `atime` churn.
 
 ---
 
@@ -57,7 +59,7 @@ git clone https://github.com/beckhq/caisson.git
 cd caisson && cargo build --release
 ```
 
-### 2. One-Time Setup (`sudo` once — never needed again for worktrees)
+### 2. One-Time Setup (`sudo` once; never needed again for worktrees)
 
 ```bash
 # Audit your Mac's current daemon overhead first (read-only, no sudo)
@@ -75,7 +77,7 @@ sudo caisson daemon install
 
 ### 3. Daily Zero-`sudo` Agent & Developer Worktrees
 
-Run directly inside **any existing git repository**—no need to move `~/workspace`:
+Run directly inside **any existing git repository**, with no need to move `~/workspace`:
 
 ```bash
 # Create an isolated worktree on /Volumes/caisson (with instant APFS CoW dependency cloning)
@@ -108,14 +110,14 @@ caisson gc
 
 ```text
 Internal APFS Container (e.g. disk3)
-├── Macintosh HD / Data          (macOS system & personal files — untouched)
+├── Macintosh HD / Data          (macOS system & personal files, untouched)
 │
 ├── [Tier 1] /Volumes/caisson    (Created ONCE via `sudo caisson init`)
 │   ├── .caisson-volume.json     (UUID ownership marker)
 │   ├── .metadata_never_index    (Spotlight shield)
 │   ├── .fseventsd/no_log        (Disable persistent fseventsd disk logs)
 │   ├── .Trashes                 (0-byte file blocking Finder trash creation)
-│   ├── worktrees/<repo>/<slug>/ (All `caisson wt` worktrees — ZERO sudo!)
+│   ├── worktrees/<repo>/<slug>/ (All `caisson wt` worktrees, ZERO sudo!)
 │   ├── cache/<repo>/            (Optional warm CoW templates for node_modules/.venv)
 │   └── .trash/<uuid>/           (<1 ms atomic rename target for async unlink)
 │
@@ -232,7 +234,7 @@ Caisson treats destructive disk operations with extreme conservatism:
 2. **Explicit confirmation:** Interactive volume-name confirmation or `--yes` required.
 3. **Dry-run everywhere:** `--dry-run` prints every privileged command without mutating disk.
 4. **Zero persistent root daemon:** The boot LaunchDaemon runs once (`RunAtLoad = true`, `KeepAlive = false`) and exits immediately.
-5. **Structured APFS parsing:** Always parses `diskutil ... -plist` structurally via `plist`—never fragile text regexes.
+5. **Structured APFS parsing:** Always parses `diskutil ... -plist` structurally via `plist`, never fragile text regexes.
 
 ---
 

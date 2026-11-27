@@ -28,7 +28,7 @@ sudo CAISSON_INTEGRATION_TESTS=1 cargo test --test apfs_privileged -- --nocaptur
 ## Engineering Principles
 
 1. **Conventional Commits:** Prefix commits and PR titles with `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `perf:`, `ci:`, or `chore:`. Squash-merge PRs into `main` so git history remains clean and release notes auto-generate cleanly.
-2. **Structured `diskutil` Parsing:** Always parse `diskutil ... -plist` output structurally via the `plist` crate — never scrape human-readable text output.
+2. **Structured `diskutil` Parsing:** Always parse `diskutil ... -plist` output structurally via the `plist` crate, never by scraping human-readable text output.
 3. **Unconditional Safety Invariants:** Never weaken the safety invariants documented in [`ARCHITECTURE.md`](./ARCHITECTURE.md) §6:
    - Triple-checked `destroy` (registry UUID + `.caisson-volume.json` marker UUID + non-system APFS role guard + explicit confirmation/`--yes`).
    - Strict volume naming (`[a-z0-9][a-z0-9._-]*`).

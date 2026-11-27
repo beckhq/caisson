@@ -50,7 +50,7 @@ pub struct MountAllReport {
 }
 
 /// Generate the auditable one-shot LaunchDaemon plist XML (`ARCHITECTURE.md` §4).
-/// `RunAtLoad = true`, `KeepAlive = false` — runs `caisson mount-all` once at boot and exits.
+/// `RunAtLoad = true`, `KeepAlive = false`: runs `caisson mount-all` once at boot and exits.
 pub fn generate_plist_xml(caisson_bin: &Path) -> Result<String> {
     let mut dict = Dictionary::new();
     dict.insert(
