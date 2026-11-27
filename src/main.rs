@@ -21,7 +21,8 @@ use caisson::registry::{VolumeRegistry, VolumeTier};
 use caisson::units::format_bytes;
 use caisson::watch::{run_watch, WatchOptions};
 use caisson::worktree::manager::{
-    run_gc, wt_add, wt_ls, wt_path, wt_prune, wt_rm, WtAddOptions, WtPruneOptions,
+    run_gc, wt_add, wt_hydrate, wt_ls, wt_path, wt_prune, wt_rm, WtAddOptions, WtHydrateOptions,
+    WtPruneOptions,
 };
 use clap::{CommandFactory, Parser};
 use clap_complete::{generate, Shell};
@@ -712,6 +713,60 @@ fn dispatch(cli: Cli) -> Result<()> {
                                 "Re-run with `--apply` to remove these {} worktree(s).",
                                 report.pruned.len()
                             );
+                        }
+                    }
+                }
+
+                WtCommands::Hydrate {
+                    path,
+                    dry_run,
+                    no_post_create,
+                } => {
+                    let report = wt_hydrate(
+                        &cfg,
+                        &WtHydrateOptions {
+                            path,
+                            dry_run,
+                            no_post_create,
+                        },
+                    )?;
+                    if json {
+                        print_json(&report)?;
+                    } else {
+                        let prefix = if report.dry_run { "[dry-run] " } else { "" };
+                        if report.cow_clones.is_empty() && report.post_create_command.is_none() {
+                            println!(
+                                "{prefix}Hydrate {}: no .caisson.toml cow_copy entries configured.",
+                                report.worktree_path
+                            );
+                        } else {
+                            for c in &report.cow_clones {
+                                match c.status.as_str() {
+                                    "cloned" => println!(
+                                        "{prefix}cow-cloned '{}' from {}",
+                                        c.entry,
+                                        c.source.as_deref().unwrap_or("")
+                                    ),
+                                    "planned" => println!(
+                                        "{prefix}would cow-clone '{}' from {}",
+                                        c.entry,
+                                        c.source.as_deref().unwrap_or("")
+                                    ),
+                                    _ => println!(
+                                        "{prefix}cow-copy '{}' ({}): {}",
+                                        c.entry,
+                                        c.status,
+                                        c.detail.as_deref().unwrap_or("")
+                                    ),
+                                }
+                            }
+                            if let Some(ref hook) = report.post_create_command {
+                                if report.dry_run {
+                                    println!("{prefix}would run post_create: {hook}");
+                                } else if report.post_create_ran {
+                                    println!("ran post_create: {hook}");
+                                }
+                            }
                         }
                     }
                 }

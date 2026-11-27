@@ -1,4 +1,7 @@
-use crate::apfs::diskutil::{diskutil_info, execute_mount_volume, list_apfs};
+use crate::apfs::diskutil::{
+    diskutil_info, execute_mount_volume, execute_unmount_volume, is_custom_mount_point, list_apfs,
+    validate_safe_custom_mount_dir,
+};
 use crate::apfs::shield::{apply_shields, ShieldApplyReport, ShieldOptions};
 use crate::apfs::statfs::is_root;
 use crate::apfs::volume::verify_mount_root_matches_uuid;
@@ -443,21 +446,174 @@ pub fn mount_all(registry_path: &Path, dry_run: bool) -> Result<MountAllReport> 
         }
 
         let mut mounted_action = "already-mounted".to_string();
+        let expected_mp = PathBuf::from(&vol.mount_point);
+        let custom_mp = is_custom_mount_point(&vol.name, &expected_mp);
+
         let live_mount = diskutil_info(&vol.uuid)
             .ok()
             .and_then(|info| info.mount_point)
             .filter(|s| !s.trim().is_empty());
 
         let mount_point = match live_mount {
-            Some(mp) => PathBuf::from(mp),
-            None => {
-                if dry_run {
-                    mounted_action = format!("planned: diskutil mount {}", vol.uuid);
-                    PathBuf::from(&vol.mount_point)
+            Some(mp) => {
+                let live_path = PathBuf::from(&mp);
+                let canon_live = fs::canonicalize(&live_path).unwrap_or_else(|_| live_path.clone());
+                let canon_expected =
+                    fs::canonicalize(&expected_mp).unwrap_or_else(|_| expected_mp.clone());
+
+                if custom_mp && canon_live != canon_expected {
+                    // macOS auto-mounted a custom-mountpoint volume at `/Volumes/<name>` after reboot.
+                    // Verify identity & marker first, ensure the custom target dir is empty and safe,
+                    // then cleanly unmount and remount at the registered custom mount point.
+                    if let Err(e) = validate_safe_custom_mount_dir(&expected_mp, !dry_run) {
+                        results.push(MountAllVolumeResult {
+                            name: vol.name.clone(),
+                            uuid: vol.uuid.clone(),
+                            mount_point: vol.mount_point.clone(),
+                            mounted_action: "custom-mountpoint-unsafe".to_string(),
+                            shield_report: None,
+                            error: Some(e.to_string()),
+                        });
+                        continue;
+                    }
+                    if dry_run {
+                        mounted_action = format!(
+                            "planned: diskutil unmount {} && diskutil mount -mountPoint {} {}",
+                            vol.uuid,
+                            expected_mp.display(),
+                            vol.uuid
+                        );
+                        expected_mp.clone()
+                    } else {
+                        if let Err(e) = verify_mount_root_matches_uuid(&live_path, &vol.uuid) {
+                            results.push(MountAllVolumeResult {
+                                name: vol.name.clone(),
+                                uuid: vol.uuid.clone(),
+                                mount_point: live_path.display().to_string(),
+                                mounted_action: "remount-rejected".to_string(),
+                                shield_report: None,
+                                error: Some(e.to_string()),
+                            });
+                            continue;
+                        }
+                        match VolumeMarker::read_from(&live_path) {
+                            Ok(marker)
+                                if marker.managed_by == "caisson"
+                                    && marker.uuid.eq_ignore_ascii_case(&vol.uuid) => {}
+                            Ok(marker) => {
+                                results.push(MountAllVolumeResult {
+                                    name: vol.name.clone(),
+                                    uuid: vol.uuid.clone(),
+                                    mount_point: live_path.display().to_string(),
+                                    mounted_action: "remount-rejected".to_string(),
+                                    shield_report: None,
+                                    error: Some(format!(
+                                        "on-volume marker mismatch (managed_by={}, uuid={})",
+                                        marker.managed_by, marker.uuid
+                                    )),
+                                });
+                                continue;
+                            }
+                            Err(e) => {
+                                results.push(MountAllVolumeResult {
+                                    name: vol.name.clone(),
+                                    uuid: vol.uuid.clone(),
+                                    mount_point: live_path.display().to_string(),
+                                    mounted_action: "remount-rejected".to_string(),
+                                    shield_report: None,
+                                    error: Some(format!("failed to verify on-volume marker: {e}")),
+                                });
+                                continue;
+                            }
+                        }
+
+                        if let Err(e) = execute_unmount_volume(&vol.uuid) {
+                            results.push(MountAllVolumeResult {
+                                name: vol.name.clone(),
+                                uuid: vol.uuid.clone(),
+                                mount_point: live_path.display().to_string(),
+                                mounted_action: "unmount-failed".to_string(),
+                                shield_report: None,
+                                error: Some(e.to_string()),
+                            });
+                            continue;
+                        }
+                        match execute_mount_volume(&vol.uuid, Some(&expected_mp)) {
+                            Ok(_) => {
+                                mounted_action = "remounted-custom".to_string();
+                                match diskutil_info(&vol.uuid)
+                                    .ok()
+                                    .and_then(|info| info.mount_point)
+                                    .filter(|s| !s.trim().is_empty())
+                                {
+                                    Some(remounted) => PathBuf::from(remounted),
+                                    None => {
+                                        results.push(MountAllVolumeResult {
+                                            name: vol.name.clone(),
+                                            uuid: vol.uuid.clone(),
+                                            mount_point: vol.mount_point.clone(),
+                                            mounted_action: "mount-unverified".to_string(),
+                                            shield_report: None,
+                                            error: Some(format!(
+                                                "diskutil mount -mountPoint succeeded for {} but no live mount point was reported",
+                                                vol.uuid
+                                            )),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                results.push(MountAllVolumeResult {
+                                    name: vol.name.clone(),
+                                    uuid: vol.uuid.clone(),
+                                    mount_point: vol.mount_point.clone(),
+                                    mounted_action: "mount-failed".to_string(),
+                                    shield_report: None,
+                                    error: Some(e.to_string()),
+                                });
+                                continue;
+                            }
+                        }
+                    }
                 } else {
-                    match execute_mount_volume(&vol.uuid) {
+                    live_path
+                }
+            }
+            None => {
+                if custom_mp {
+                    if let Err(e) = validate_safe_custom_mount_dir(&expected_mp, !dry_run) {
+                        results.push(MountAllVolumeResult {
+                            name: vol.name.clone(),
+                            uuid: vol.uuid.clone(),
+                            mount_point: vol.mount_point.clone(),
+                            mounted_action: "custom-mountpoint-unsafe".to_string(),
+                            shield_report: None,
+                            error: Some(e.to_string()),
+                        });
+                        continue;
+                    }
+                }
+                if dry_run {
+                    mounted_action = if custom_mp {
+                        format!(
+                            "planned: diskutil mount -mountPoint {} {}",
+                            expected_mp.display(),
+                            vol.uuid
+                        )
+                    } else {
+                        format!("planned: diskutil mount {}", vol.uuid)
+                    };
+                    expected_mp.clone()
+                } else {
+                    let target_mp = custom_mp.then_some(expected_mp.as_path());
+                    match execute_mount_volume(&vol.uuid, target_mp) {
                         Ok(_) => {
-                            mounted_action = "mounted".to_string();
+                            mounted_action = if custom_mp {
+                                "mounted-custom".to_string()
+                            } else {
+                                "mounted".to_string()
+                            };
                             match diskutil_info(&vol.uuid)
                                 .ok()
                                 .and_then(|info| info.mount_point)

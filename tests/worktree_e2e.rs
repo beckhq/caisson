@@ -722,3 +722,120 @@ fn cli_agent_status_install_dismiss_uninstall_and_snippet() {
     assert!(snip.status.success());
     assert!(String::from_utf8_lossy(&snip.stdout).contains("caisson wt add"));
 }
+
+#[test]
+fn wt_hydrate_clones_from_sibling_worktree_for_external_worktree_managers() {
+    let sandbox = tempdir().unwrap();
+    let repo_dir = sandbox.path().join("t3-demo-app");
+    let external_wt_root = sandbox.path().join("t3-worktrees");
+    let caisson_root = sandbox.path().join("mock-caisson-vol");
+    let config_path = sandbox.path().join("config.toml");
+    fs::create_dir_all(&external_wt_root).unwrap();
+    fs::create_dir_all(&caisson_root).unwrap();
+
+    init_sample_repo(&repo_dir);
+
+    fs::write(
+        repo_dir.join(".caisson.toml"),
+        r#"
+[worktree]
+cow_copy = ["node_modules", ".venv"]
+post_create = "echo hydrated:$CAISSON_BRANCH > .hook-ran"
+"#,
+    )
+    .unwrap();
+    run_git(&repo_dir, &["add", ".caisson.toml"]);
+    run_git(&repo_dir, &["commit", "-m", "add caisson config"]);
+
+    // Simulate T3 Code creating two raw git worktrees outside Caisson's own `worktrees/` dir.
+    let wt_donor = external_wt_root.join("thread-1");
+    let wt_new = external_wt_root.join("thread-2");
+    run_git(
+        &repo_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "t3/thread-1",
+            wt_donor.to_str().unwrap(),
+        ],
+    );
+    run_git(
+        &repo_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "t3/thread-2",
+            wt_new.to_str().unwrap(),
+        ],
+    );
+
+    // Populate `node_modules` in the sibling worktree (donor), and `.venv` in main repo.
+    fs::create_dir_all(wt_donor.join("node_modules/pkg")).unwrap();
+    fs::write(wt_donor.join("node_modules/pkg/index.js"), "v1-sibling\n").unwrap();
+    fs::create_dir_all(repo_dir.join(".venv/bin")).unwrap();
+    fs::write(repo_dir.join(".venv/bin/python"), "py-main\n").unwrap();
+
+    // 1. `--dry-run` plans both clones without writing anything or running `post_create`.
+    let dry = run_caisson(
+        &wt_new,
+        &caisson_root,
+        &config_path,
+        &["wt", "hydrate", "--dry-run", "--json"],
+    );
+    assert!(
+        dry.status.success(),
+        "dry-run failed: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let dry_json: Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(dry_json["dry_run"], true);
+    assert_eq!(dry_json["post_create_ran"], false);
+    assert_eq!(dry_json["cow_clones"][0]["status"], "planned");
+    assert_eq!(dry_json["cow_clones"][1]["status"], "planned");
+    assert!(!wt_new.join("node_modules").exists());
+    assert!(!wt_new.join(".hook-ran").exists());
+
+    // 2. Real hydrate with `--no-post-create` clones both entries and skips hook.
+    let hyd1 = run_caisson(
+        &wt_new,
+        &caisson_root,
+        &config_path,
+        &["wt", "hydrate", "--no-post-create", "--json"],
+    );
+    assert!(
+        hyd1.status.success(),
+        "hydrate failed: {}",
+        String::from_utf8_lossy(&hyd1.stderr)
+    );
+    let hyd1_json: Value = serde_json::from_slice(&hyd1.stdout).unwrap();
+    assert_eq!(hyd1_json["cow_clones"][0]["status"], "cloned");
+    assert_eq!(hyd1_json["cow_clones"][1]["status"], "cloned");
+    assert_eq!(hyd1_json["post_create_ran"], false);
+    assert!(!wt_new.join(".hook-ran").exists());
+
+    // Verify APFS CoW independence: mutating cloned file does not alter donor.
+    fs::write(wt_new.join("node_modules/pkg/index.js"), "mutated\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(wt_donor.join("node_modules/pkg/index.js")).unwrap(),
+        "v1-sibling\n"
+    );
+
+    // 3. Re-running `wt hydrate` is idempotent (skips existing dirs) and runs `post_create`.
+    let hyd2 = run_caisson(
+        &wt_new,
+        &caisson_root,
+        &config_path,
+        &["wt", "hydrate", "--json"],
+    );
+    assert!(hyd2.status.success());
+    let hyd2_json: Value = serde_json::from_slice(&hyd2.stdout).unwrap();
+    assert_eq!(hyd2_json["cow_clones"][0]["status"], "skipped");
+    assert_eq!(hyd2_json["cow_clones"][1]["status"], "skipped");
+    assert_eq!(hyd2_json["post_create_ran"], true);
+    assert_eq!(
+        fs::read_to_string(wt_new.join(".hook-ran")).unwrap().trim(),
+        "hydrated:t3/thread-2"
+    );
+}

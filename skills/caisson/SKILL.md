@@ -36,6 +36,9 @@ Always pass `--json` when parsing output programmatically.
 # Create a worktree on /Volumes/caisson
 caisson wt add <branch> [--from <ref>] [--name <slug>] --json
 
+# Hydrate an existing worktree (e.g. host-managed) from `.caisson.toml` via same-volume APFS CoW
+caisson wt hydrate [--dry-run] [--no-post-create] --json
+
 # List managed worktrees (current repo, or --all across repos)
 caisson wt ls --json
 caisson wt ls --all --json

@@ -1,7 +1,7 @@
 use crate::apfs::diskutil::{
     build_add_volume_args, compute_auto_quota, detect_internal_container, diskutil_info,
-    execute_add_volume, execute_delete_volume, list_apfs, validate_volume_name,
-    verify_destroy_safety, ApfsContainer,
+    execute_add_volume, execute_delete_volume, is_custom_mount_point, list_apfs,
+    validate_safe_custom_mount_dir, validate_volume_name, verify_destroy_safety, ApfsContainer,
 };
 use crate::apfs::shield::{
     apply_shields, inspect_shields, ShieldApplyReport, ShieldOptions, ShieldStatus,
@@ -168,6 +168,12 @@ pub fn create_volume(
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("/Volumes/{}", opts.name)));
 
+    if let Some(ref custom_mp) = opts.mount_point {
+        if is_custom_mount_point(&opts.name, custom_mp) {
+            validate_safe_custom_mount_dir(custom_mp, false)?;
+        }
+    }
+
     let args = build_add_volume_args(
         &container.container_reference,
         &opts.name,
@@ -223,6 +229,20 @@ pub fn create_volume(
                 "vol create".to_string()
             },
         });
+    }
+
+    if let Some(ref custom_mp) = opts.mount_point {
+        if is_custom_mount_point(&opts.name, custom_mp) {
+            let existed = custom_mp.exists();
+            validate_safe_custom_mount_dir(custom_mp, true)?;
+            if !existed {
+                if let Some(ref user) = owner {
+                    let _ = Command::new("chown")
+                        .args([&format!("{user}:staff"), &custom_mp.display().to_string()])
+                        .output();
+                }
+            }
+        }
     }
 
     execute_add_volume(&args)?;

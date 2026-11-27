@@ -312,6 +312,21 @@ pub enum WtCommands {
         #[arg(long)]
         sync: bool,
     },
+
+    /// Hydrate an existing git worktree (e.g. from T3 Code or `git worktree add`) with `.caisson.toml` CoW clones.
+    Hydrate {
+        /// Path inside the target git worktree (defaults to current working directory).
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Preview planned CoW clones and donor paths without modifying files.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip running the `.caisson.toml` `worktree.post_create` hook.
+        #[arg(long)]
+        no_post_create: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

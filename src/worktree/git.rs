@@ -79,6 +79,13 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Discover the top-level working tree directory for `start_dir` (canonicalized).
+pub fn worktree_toplevel(start_dir: &Path) -> Result<PathBuf> {
+    let raw = run_git(start_dir, &["rev-parse", "--show-toplevel"])?;
+    let path = PathBuf::from(raw);
+    Ok(fs::canonicalize(&path).unwrap_or(path))
+}
+
 /// Discover the primary git repository root and stable `repo_id` from any path inside the repo
 /// (works identically from the main checkout or any linked worktree).
 pub fn discover_repo(start_dir: &Path) -> Result<GitRepoContext> {

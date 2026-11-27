@@ -1,12 +1,13 @@
 use crate::apfs::clonefile::clone_path;
-use crate::apfs::statfs::same_volume;
+use crate::apfs::statfs::{same_volume, statfs_path};
 use crate::config::{CaissonConfig, RepoConfig};
 use crate::error::{CaissonError, Result};
 use crate::units::{format_age, parse_duration};
 use crate::worktree::activity::{compute_last_activity, inactive_duration};
 use crate::worktree::git::{
-    add_git_worktree, discover_repo, inspect_worktree_git_state, owner_repo_root_from_worktree,
-    prune_git_worktrees, sanitize_slug, worktree_current_branch, GitRepoContext,
+    add_git_worktree, discover_repo, inspect_worktree_git_state, list_git_worktrees,
+    owner_repo_root_from_worktree, prune_git_worktrees, sanitize_slug, worktree_current_branch,
+    worktree_toplevel, GitRepoContext,
 };
 use crate::worktree::quotas::{evaluate_add_quotas, measure_root_usage, QuotaSnapshot};
 use crate::worktree::trash::{
@@ -112,6 +113,27 @@ pub struct GcReport {
     pub trash: TrashDrainReport,
     pub pruned_repos: Vec<String>,
     pub removed_empty_repo_dirs: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct WtHydrateOptions {
+    pub path: Option<PathBuf>,
+    pub dry_run: bool,
+    pub no_post_create: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WtHydrateReport {
+    pub repo_id: String,
+    pub main_repo_root: String,
+    pub worktree_path: String,
+    pub branch: Option<String>,
+    pub volume_mount: Option<String>,
+    pub dry_run: bool,
+    pub cow_clones: Vec<CowCloneOutcome>,
+    pub post_create_ran: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_create_command: Option<String>,
 }
 
 fn ensure_non_symlink_dir(path: &Path, label: &str) -> Result<()> {
@@ -455,6 +477,38 @@ fn cow_clone_entry(
     target_wt: &Path,
     entry: &str,
 ) -> CowCloneOutcome {
+    let mut candidate_roots: Vec<PathBuf> = vec![
+        caisson_root.join("cache").join(&repo.repo_id),
+        caisson_root.join("cache").join(&repo.repo_name),
+    ];
+    candidate_roots.extend(siblings.iter().cloned());
+
+    let mut cross_volume_sources = Vec::new();
+    if same_volume(&repo.main_repo_root, target_wt).unwrap_or(false) {
+        candidate_roots.push(repo.main_repo_root.clone());
+    } else {
+        cross_volume_sources.push(repo.main_repo_root.clone());
+    }
+
+    let seed_hint = caisson_root.join("cache").join(&repo.repo_name);
+    cow_clone_from_candidates(
+        &candidate_roots,
+        &cross_volume_sources,
+        &seed_hint,
+        target_wt,
+        entry,
+        false,
+    )
+}
+
+fn cow_clone_from_candidates(
+    candidate_roots: &[PathBuf],
+    cross_volume_roots: &[PathBuf],
+    seed_cache_base: &Path,
+    target_wt: &Path,
+    entry: &str,
+    dry_run: bool,
+) -> CowCloneOutcome {
     let rel = match validate_relative_cow_entry(entry) {
         Ok(p) => p,
         Err(e) => {
@@ -467,7 +521,7 @@ fn cow_clone_entry(
         }
     };
 
-    // Guard destination against intermediate symlink escapes inside the new worktree.
+    // Guard destination against intermediate symlink escapes inside the target worktree.
     if let Err(e) = ensure_no_symlink_escape(target_wt, &rel) {
         return CowCloneOutcome {
             entry: entry.to_string(),
@@ -483,29 +537,15 @@ fn cow_clone_entry(
             entry: entry.to_string(),
             source: None,
             status: "skipped".to_string(),
-            detail: Some("already exists in new worktree".to_string()),
+            detail: Some("already exists in worktree".to_string()),
         };
     }
 
-    // Priority order for donor selection (all same-volume candidates first, validated against symlink escape):
-    let mut candidate_roots: Vec<PathBuf> = vec![
-        caisson_root.join("cache").join(&repo.repo_id),
-        caisson_root.join("cache").join(&repo.repo_name),
-    ];
-    candidate_roots.extend(siblings.iter().cloned());
-
-    let main_candidate = repo.main_repo_root.join(&rel);
-    let mut cross_volume_main_exists = false;
-    if fs::symlink_metadata(&main_candidate).is_ok() {
-        if same_volume(&main_candidate, target_wt).unwrap_or(false) {
-            candidate_roots.push(repo.main_repo_root.clone());
-        } else {
-            cross_volume_main_exists = true;
-        }
-    }
-
-    let donor = candidate_roots.into_iter().find_map(|root| {
+    let donor = candidate_roots.iter().find_map(|root| {
         if !root.is_dir() {
+            return None;
+        }
+        if !same_volume(root, target_wt).unwrap_or(false) {
             return None;
         }
         let candidate = root.join(&rel);
@@ -515,26 +555,28 @@ fn cow_clone_entry(
         // Reject intermediate symlink traversal in donor root as well.
         if let Some(rel_parent) = rel.parent() {
             if !rel_parent.as_os_str().is_empty()
-                && ensure_no_symlink_escape(&root, rel_parent).is_err()
+                && ensure_no_symlink_escape(root, rel_parent).is_err()
             {
                 return None;
             }
+        }
+        if !same_volume(&candidate, target_wt).unwrap_or(false) {
+            return None;
         }
         Some(candidate)
     });
 
     let Some(donor_path) = donor else {
-        let detail = if cross_volume_main_exists {
+        let cross_volume_exists = cross_volume_roots
+            .iter()
+            .any(|root| fs::symlink_metadata(root.join(&rel)).is_ok());
+        let detail = if cross_volume_exists {
             format!(
-                "source exists in main repo on a different volume (cross-volume clonefile EXDEV); seed `{}` or create one worktree with deps to enable instant CoW cloning",
-                caisson_root
-                    .join("cache")
-                    .join(&repo.repo_name)
-                    .join(&rel)
-                    .display()
+                "source exists on a different volume (cross-volume clonefile EXDEV); seed `{}` or build one worktree on this volume to enable instant CoW cloning",
+                seed_cache_base.join(&rel).display()
             )
         } else {
-            "no donor directory found in cache, sibling worktrees, or main repo".to_string()
+            "no same-volume donor found in cache, sibling worktrees, or main repo".to_string()
         };
         return CowCloneOutcome {
             entry: entry.to_string(),
@@ -543,6 +585,15 @@ fn cow_clone_entry(
             detail: Some(detail),
         };
     };
+
+    if dry_run {
+        return CowCloneOutcome {
+            entry: entry.to_string(),
+            source: Some(donor_path.display().to_string()),
+            status: "planned".to_string(),
+            detail: None,
+        };
+    }
 
     if let Some(parent) = dst.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
@@ -594,6 +645,133 @@ fn cow_clone_entry(
             detail: Some(e.to_string()),
         },
     }
+}
+
+/// Hydrate an existing git worktree (created by T3 Code, an IDE, or `git worktree add`)
+/// using `.caisson.toml` `cow_copy` entries via same-volume APFS `clonefile(2)` and optional
+/// `post_create` hook.
+pub fn wt_hydrate(config: &CaissonConfig, opts: &WtHydrateOptions) -> Result<WtHydrateReport> {
+    let start_dir = match opts.path {
+        Some(ref p) => p.clone(),
+        None => std::env::current_dir()?,
+    };
+    let repo = discover_repo(&start_dir)?;
+    let target_wt = worktree_toplevel(&start_dir)?;
+    let branch = worktree_current_branch(&target_wt);
+
+    // Prefer `.caisson.toml` from the target worktree if present (so branch edits apply),
+    // otherwise fall back to the primary repository root.
+    let repo_cfg = if target_wt.join(".caisson.toml").is_file() {
+        RepoConfig::load_from_repo(&target_wt)?
+    } else {
+        RepoConfig::load_from_repo(&repo.main_repo_root)?
+    };
+
+    let volume_mount = statfs_path(&target_wt).ok().map(|st| st.mount_point);
+    let caisson_root = config.resolve_root();
+
+    // Build same-volume donor search order:
+    // 1. `<volume_mount>/.caisson-cache/<repo_id>` and `<repo_name>` (for dedicated volumes like ~/.t3/worktrees)
+    // 2. `<caisson_root>/cache/<repo_id>` and `<repo_name>` (when on same volume)
+    // 3. Other git worktrees of this repo on the same volume, ordered by newest activity first.
+    let mut candidate_roots: Vec<PathBuf> = Vec::new();
+    let mut cross_volume_roots: Vec<PathBuf> = Vec::new();
+
+    if let Some(ref mp) = volume_mount {
+        if mp != "/" {
+            let vol_cache = PathBuf::from(mp).join(".caisson-cache");
+            candidate_roots.push(vol_cache.join(&repo.repo_id));
+            candidate_roots.push(vol_cache.join(&repo.repo_name));
+        }
+    }
+    if caisson_root.exists() && same_volume(&caisson_root, &target_wt).unwrap_or(false) {
+        candidate_roots.push(caisson_root.join("cache").join(&repo.repo_id));
+        candidate_roots.push(caisson_root.join("cache").join(&repo.repo_name));
+    }
+
+    let git_worktrees = list_git_worktrees(&repo.main_repo_root).unwrap_or_default();
+    let mut same_vol_peers: Vec<(Option<SystemTime>, PathBuf)> = Vec::new();
+    for wt in git_worktrees {
+        if wt.bare || wt.prunable || !wt.path.is_dir() {
+            continue;
+        }
+        let canon = fs::canonicalize(&wt.path).unwrap_or(wt.path);
+        if canon == target_wt {
+            continue;
+        }
+        if same_volume(&canon, &target_wt).unwrap_or(false) {
+            let activity = compute_last_activity(&canon);
+            same_vol_peers.push((activity, canon));
+        } else {
+            cross_volume_roots.push(canon);
+        }
+    }
+    // Newest activity first, tie-break deterministically by path.
+    same_vol_peers.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    for (_, peer_path) in same_vol_peers {
+        if !candidate_roots.contains(&peer_path) {
+            candidate_roots.push(peer_path);
+        }
+    }
+
+    let seed_cache_base = match volume_mount.as_deref() {
+        Some(mp) if mp != "/" => PathBuf::from(mp)
+            .join(".caisson-cache")
+            .join(&repo.repo_name),
+        _ => caisson_root.join("cache").join(&repo.repo_name),
+    };
+
+    let mut cow_clones = Vec::new();
+    for entry in &repo_cfg.worktree.cow_copy {
+        cow_clones.push(cow_clone_from_candidates(
+            &candidate_roots,
+            &cross_volume_roots,
+            &seed_cache_base,
+            &target_wt,
+            entry,
+            opts.dry_run,
+        ));
+    }
+
+    let mut post_create_ran = false;
+    let mut post_create_command = None;
+    if !opts.no_post_create {
+        if let Some(ref hook) = repo_cfg.worktree.post_create {
+            let trimmed = hook.trim();
+            if !trimmed.is_empty() {
+                post_create_command = Some(trimmed.to_string());
+                if !opts.dry_run {
+                    let out = Command::new("/bin/sh")
+                        .args(["-c", trimmed])
+                        .current_dir(&target_wt)
+                        .env("CAISSON_WORKTREE", &target_wt)
+                        .env("CAISSON_REPO", &repo.main_repo_root)
+                        .env("CAISSON_BRANCH", branch.as_deref().unwrap_or(""))
+                        .output()?;
+                    if !out.status.success() {
+                        return Err(CaissonError::CommandFailed {
+                            cmd: format!("post_create: {trimmed}"),
+                            code: out.status.code(),
+                            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                        });
+                    }
+                    post_create_ran = true;
+                }
+            }
+        }
+    }
+
+    Ok(WtHydrateReport {
+        repo_id: repo.repo_id,
+        main_repo_root: repo.main_repo_root.display().to_string(),
+        worktree_path: target_wt.display().to_string(),
+        branch,
+        volume_mount,
+        dry_run: opts.dry_run,
+        cow_clones,
+        post_create_ran,
+        post_create_command,
+    })
 }
 
 /// List Caisson worktrees (for the current repo by default, or across all repos with `--all`).

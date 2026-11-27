@@ -534,12 +534,91 @@ pub fn execute_delete_volume(uuid: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Mount an APFS volume by UUID or device identifier.
-pub fn execute_mount_volume(target: &str) -> Result<String> {
-    let output = Command::new("diskutil").args(["mount", target]).output()?;
+/// Return true when `mount_point` differs from macOS's default `/Volumes/<name>` mount path.
+pub fn is_custom_mount_point(name: &str, mount_point: &Path) -> bool {
+    let default_mp = PathBuf::from(format!("/Volumes/{name}"));
+    mount_point != default_mp.as_path()
+}
+
+/// Validate that a custom mount point directory is safe to mount over (absolute, non-system,
+/// non-symlink, and empty if it already exists). Optionally creates the directory if missing.
+pub fn validate_safe_custom_mount_dir(mount_point: &Path, create_if_missing: bool) -> Result<()> {
+    if !mount_point.is_absolute() {
+        return Err(CaissonError::Message(format!(
+            "custom mount point '{}' must be an absolute path",
+            mount_point.display()
+        )));
+    }
+    let mp_str = mount_point.to_string_lossy();
+    let trimmed = mp_str.trim_end_matches('/');
+    if trimmed.is_empty()
+        || trimmed == "/System"
+        || trimmed.starts_with("/System/")
+        || matches!(
+            trimmed,
+            "/Volumes" | "/Applications" | "/Library" | "/Users" | "/bin" | "/sbin" | "/usr"
+        )
+    {
+        return Err(CaissonError::Message(format!(
+            "refusing to use protected system directory '{}' as a custom mount point",
+            mount_point.display()
+        )));
+    }
+
+    match std::fs::symlink_metadata(mount_point) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(CaissonError::Message(format!(
+                    "refusing to mount over symlink or non-directory '{}'",
+                    mount_point.display()
+                )));
+            }
+            if std::fs::read_dir(mount_point)?.next().is_some() {
+                return Err(CaissonError::Message(format!(
+                    "refusing to mount over non-empty directory '{}'; move or back up existing contents first so they are not hidden beneath the mounted volume",
+                    mount_point.display()
+                )));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if create_if_missing {
+                std::fs::create_dir_all(mount_point)?;
+            }
+            Ok(())
+        }
+        Err(e) => Err(CaissonError::Io(e)),
+    }
+}
+
+/// Mount an APFS volume by UUID or device identifier, optionally at a custom `-mountPoint`.
+pub fn execute_mount_volume(target: &str, custom_mount_point: Option<&Path>) -> Result<String> {
+    let mut args: Vec<String> = vec!["mount".to_string()];
+    if let Some(mp) = custom_mount_point {
+        args.push("-mountPoint".to_string());
+        args.push(mp.display().to_string());
+    }
+    args.push(target.to_string());
+
+    let output = Command::new("diskutil").args(&args).output()?;
     if !output.status.success() {
         return Err(CaissonError::CommandFailed {
-            cmd: format!("diskutil mount {target}"),
+            cmd: format!("diskutil {}", args.join(" ")),
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Unmount an APFS volume by UUID or device identifier without forcing busy handles.
+pub fn execute_unmount_volume(target: &str) -> Result<String> {
+    let output = Command::new("diskutil")
+        .args(["unmount", target])
+        .output()?;
+    if !output.status.success() {
+        return Err(CaissonError::CommandFailed {
+            cmd: format!("diskutil unmount {target}"),
             code: output.status.code(),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
@@ -987,5 +1066,44 @@ mod tests {
         assert!(!apfs.containers.is_empty());
         let primary = detect_internal_container().unwrap();
         assert!(primary.capacity_ceiling > 0);
+    }
+
+    #[test]
+    fn custom_mount_point_detection_and_validation() {
+        use std::os::unix::fs::symlink;
+
+        assert!(!is_custom_mount_point(
+            "caisson",
+            Path::new("/Volumes/caisson")
+        ));
+        assert!(is_custom_mount_point(
+            "t3-worktrees",
+            Path::new("/var/tmp/t3-worktrees")
+        ));
+
+        // Reject relative and protected system mount points.
+        assert!(validate_safe_custom_mount_dir(Path::new("relative/dir"), false).is_err());
+        assert!(validate_safe_custom_mount_dir(Path::new("/"), false).is_err());
+        assert!(validate_safe_custom_mount_dir(Path::new("/System/Library"), false).is_err());
+        assert!(validate_safe_custom_mount_dir(Path::new("/Volumes"), false).is_err());
+
+        let dir = tempdir().unwrap();
+        let empty = dir.path().join("empty-mp");
+        // Missing dir succeeds when create_if_missing=false (dry-run) and creates when true.
+        assert!(validate_safe_custom_mount_dir(&empty, false).is_ok());
+        assert!(!empty.exists());
+        assert!(validate_safe_custom_mount_dir(&empty, true).is_ok());
+        assert!(empty.is_dir());
+
+        // Non-empty dir must be refused so existing files are never hidden beneath a mount.
+        fs::write(empty.join("existing.txt"), "keep").unwrap();
+        assert!(validate_safe_custom_mount_dir(&empty, false).is_err());
+
+        // Symlink mount point must be refused.
+        let link = dir.path().join("symlink-mp");
+        let target = dir.path().join("real-target");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(validate_safe_custom_mount_dir(&link, false).is_err());
     }
 }

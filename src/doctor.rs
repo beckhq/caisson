@@ -1,10 +1,13 @@
+use crate::agents::resolve_user_home;
 use crate::apfs::shield::{inspect_shields, parse_mdutil_disabled, ShieldStatus};
+use crate::apfs::statfs::same_volume;
 use crate::apfs::volume::list_registered_volumes;
 use crate::config::CaissonConfig;
 use crate::daemon::launchd::{daemon_status, DaemonStatus, LAUNCH_DAEMON_PLIST_PATH};
 use crate::error::Result;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -374,6 +377,10 @@ pub fn run_doctor(registry_path: &Path, config: &CaissonConfig) -> Result<Doctor
         });
     }
 
+    if let Some(t3_warning) = detect_unshielded_t3_worktrees(&resolve_user_home()) {
+        warnings.push(t3_warning);
+    }
+
     for vol in &caisson_volumes {
         if !vol.shields.all_healthy {
             let fsevents_label = if vol.shields.fseventsd_no_log {
@@ -418,6 +425,27 @@ pub fn run_doctor(registry_path: &Path, config: &CaissonConfig) -> Result<Doctor
         developer_tools_hint,
         warnings,
     })
+}
+
+/// Emit an informational finding if T3 Code's `~/.t3/worktrees` directory exists and sits on `/`.
+pub fn detect_unshielded_t3_worktrees(home: &Path) -> Option<DoctorWarning> {
+    let t3_dir = home.join(".t3").join("worktrees");
+    if !t3_dir.exists() {
+        return None;
+    }
+    let resolved = fs::canonicalize(&t3_dir).unwrap_or_else(|_| t3_dir.clone());
+    if same_volume(&resolved, Path::new("/")).unwrap_or(false) {
+        return Some(DoctorWarning {
+            code: "UNSHIELDED_T3_WORKTREES".to_string(),
+            severity: "info".to_string(),
+            message: format!(
+                "T3 Code worktrees directory ({}) resides on the unshielded root volume /",
+                t3_dir.display()
+            ),
+            remediation: "Mount a dedicated shielded APFS volume at ~/.t3/worktrees (`sudo caisson vol create t3-worktrees --mount ~/.t3/worktrees --nobrowse`), then add `caisson wt hydrate` as a T3 project setup script (`runOnWorktreeCreate`).".to_string(),
+        });
+    }
+    None
 }
 
 /// Render a crisp human-readable terminal summary of `DoctorReport`.
@@ -590,5 +618,18 @@ mod tests {
         );
         assert_eq!(leaked.len(), 1);
         assert!(leaked[0].contains("test-fixture.dmg.mount"));
+    }
+
+    #[test]
+    fn detects_unshielded_t3_worktrees_only_when_present_on_root_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(detect_unshielded_t3_worktrees(dir.path()).is_none());
+
+        fs::create_dir_all(dir.path().join(".t3/worktrees")).unwrap();
+        // `tempdir()` resides on `/` (same volume as root), so it should emit the info finding.
+        let finding = detect_unshielded_t3_worktrees(dir.path()).unwrap();
+        assert_eq!(finding.code, "UNSHIELDED_T3_WORKTREES");
+        assert_eq!(finding.severity, "info");
+        assert!(finding.remediation.contains("caisson wt hydrate"));
     }
 }
