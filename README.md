@@ -51,12 +51,11 @@ Key takeaways:
 ### 1. Install
 
 ```bash
-# From source (macOS, Rust stable)
-cargo install --git https://github.com/beckhq/caisson
+# Homebrew (recommended, universal Apple Silicon + Intel binary)
+brew install beckhq/tap/caisson
 
-# Or build locally
-git clone https://github.com/beckhq/caisson.git
-cd caisson && cargo build --release
+# Or from source (macOS, Rust stable)
+cargo install --git https://github.com/beckhq/caisson
 ```
 
 ### 2. One-Time Setup (`sudo` once; never needed again for worktrees)
