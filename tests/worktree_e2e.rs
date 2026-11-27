@@ -995,6 +995,15 @@ fn wt_hydrate_never_runs_untrusted_branch_post_create_and_rm_respects_tier_prece
     assert!(!untrusted_wt.join(".pwned").exists());
 
     // 2. Deterministic tier precedence for `wt path` / `wt rm`:
+    // Relax min_host_free so test never depends on CI runner disk free space.
+    let set_free = run_caisson(
+        &repo_dir,
+        &caisson_root,
+        &config_path,
+        &["config", "set", "quotas.min_host_free", "0G"],
+    );
+    assert!(set_free.status.success());
+
     // Worktree A has branch `feat/alpha` and slug `feat-alpha`.
     // Worktree B has branch `feat-alpha` and custom slug `custom-b`.
     // Target `feat-alpha` must deterministically select exact slug (Tier 2) over exact branch (Tier 3),
@@ -1005,7 +1014,11 @@ fn wt_hydrate_never_runs_untrusted_branch_post_create_and_rm_respects_tier_prece
         &config_path,
         &["wt", "add", "feat/alpha", "--json"],
     );
-    assert!(add_a.status.success());
+    assert!(
+        add_a.status.success(),
+        "add_a failed: {}",
+        String::from_utf8_lossy(&add_a.stderr)
+    );
     let add_b = run_caisson(
         &repo_dir,
         &caisson_root,
