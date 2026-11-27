@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="246" viewBox="0 0 760 246" role="img" aria-label="The Hidden 52x macOS Developer Tools Exec Tax (syspolicyd)">
+  <defs>
+    <style>
+      .t-title { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 16px; font-weight: 700; fill: #e6edf3; }
+      .t-sub { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 11.5px; fill: #8b949e; }
+      .t-lbl { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 12.5px; font-weight: 600; fill: #e6edf3; }
+      .t-sublbl { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; fill: #8b949e; }
+      .t-sublbl-b { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; font-weight: 700; fill: #e6edf3; }
+      .t-val { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; font-weight: 700; fill: #e6edf3; }
+      .t-val-muted { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11.5px; fill: #8b949e; }
+      .t-pill { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 10.5px; font-weight: 700; }
+      .t-sec { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 12px; font-weight: 700; fill: #e6edf3; }
+      .t-kpi { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 18px; font-weight: 700; fill: #2dd4bf; }
+      .t-kpi-lbl { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 10.5px; fill: #8b949e; }
+    </style>
+  </defs>
+  <rect x="0.5" y="0.5" width="759" height="245" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <rect x="20" y="18" width="66" height="20" rx="4" fill="#1f6feb"/>
+  <text x="53" y="32" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="700" fill="#ffffff">CAISSON</text>
+  <text x="96" y="33" class="t-title">The Hidden 52x macOS Developer Tools Exec Tax (syspolicyd)</text>
+  <text x="20" y="54" class="t-sub">Live 2-binary first-exec latency probe built into caisson doctor, caisson setup, and caisson bench</text>
+  <line x1="20" y1="66" x2="740" y2="66" stroke="#21262d" stroke-width="1"/>
+
+  <text x="20" y="101" class="t-lbl">Unexempt terminal / daemon</text>
+  <text x="20" y="116" class="t-sublbl">1st exec of fresh binary</text>
+  <rect x="248" y="92" width="241.6" height="22" rx="4" fill="#f59e0b"/>
+  <text x="499.6" y="107" class="t-val" fill="#e6edf3">99.5 ms</text>
+  <rect x="586" y="93" width="154" height="20" rx="10" fill="#3b2606" stroke="#d97706" stroke-width="1"/>
+  <text x="663.0" y="106.5" text-anchor="middle" class="t-pill" fill="#fcd34d">+95 ms XProtect stall</text>
+
+  <text x="20" y="151" class="t-lbl">Developer Tools enabled</text>
+  <text x="20" y="166" class="t-sublbl">1st exec (detected by Caisson)</text>
+  <rect x="248" y="142" width="6.0" height="22" rx="4" fill="#2dd4bf"/>
+  <text x="264.0" y="157" class="t-val" fill="#2dd4bf">1.89 ms</text>
+  <rect x="657" y="143" width="83" height="20" rx="10" fill="#0d3b38" stroke="#14b8a6" stroke-width="1"/>
+  <text x="698.5" y="156.5" text-anchor="middle" class="t-pill" fill="#5eead4">52x faster</text>
+
+  <text x="20" y="201" class="t-lbl">Cached 2nd execution</text>
+  <text x="20" y="216" class="t-sublbl">OS policy cache baseline</text>
+  <rect x="248" y="192" width="6.0" height="22" rx="4" fill="#484f58"/>
+  <text x="264.0" y="207" class="t-val" fill="#e6edf3">1.42 ms</text>
+</svg>

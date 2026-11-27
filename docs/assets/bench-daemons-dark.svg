@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="296" viewBox="0 0 760 296" role="img" aria-label="macOS Background Daemon CPU Tax (5-Worktree Batch)">
+  <defs>
+    <style>
+      .t-title { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 16px; font-weight: 700; fill: #e6edf3; }
+      .t-sub { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 11.5px; fill: #8b949e; }
+      .t-lbl { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 12.5px; font-weight: 600; fill: #e6edf3; }
+      .t-sublbl { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; fill: #8b949e; }
+      .t-sublbl-b { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; font-weight: 700; fill: #e6edf3; }
+      .t-val { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; font-weight: 700; fill: #e6edf3; }
+      .t-val-muted { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11.5px; fill: #8b949e; }
+      .t-pill { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 10.5px; font-weight: 700; }
+      .t-sec { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 12px; font-weight: 700; fill: #e6edf3; }
+      .t-kpi { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 18px; font-weight: 700; fill: #2dd4bf; }
+      .t-kpi-lbl { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 10.5px; fill: #8b949e; }
+    </style>
+  </defs>
+  <rect x="0.5" y="0.5" width="759" height="295" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <rect x="20" y="18" width="66" height="20" rx="4" fill="#1f6feb"/>
+  <text x="53" y="32" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="700" fill="#ffffff">CAISSON</text>
+  <text x="96" y="33" class="t-title">macOS Background Daemon CPU Tax (5-Worktree Batch)</text>
+  <text x="20" y="54" class="t-sub">Cumulative OS daemon CPU seconds burned during provisioning + teardown · lower is better</text>
+  <line x1="20" y1="66" x2="740" y2="66" stroke="#21262d" stroke-width="1"/>
+
+  <rect x="20" y="78" width="12" height="10" rx="2" fill="#f59e0b"/>
+  <text x="38" y="87" class="t-sublbl">fseventsd</text>
+  <rect x="125" y="78" width="12" height="10" rx="2" fill="#ef4444"/>
+  <text x="143" y="87" class="t-sublbl">mds_stores (Spotlight)</text>
+  <rect x="323" y="78" width="12" height="10" rx="2" fill="#6e7681"/>
+  <text x="341" y="87" class="t-sublbl">other daemons (mds, lsd, backupd)</text>
+  <text x="20" y="125" class="t-lbl">Main Mac HD (/)</text>
+  <text x="20" y="140" class="t-sublbl">unshielded Data vol</text>
+  <rect x="185" y="108" width="357.7" height="28" rx="4" fill="#f59e0b"/>
+  <rect x="542.7" y="108" width="17.0" height="28" fill="#ef4444"/>
+  <rect x="559.6" y="108" width="40.1" height="28" rx="4" fill="#6e7681"/>
+  <text x="609.7" y="126" class="t-val">38.58 s</text>
+  <text x="20" y="175" class="t-lbl">Caisson Volume</text>
+  <text x="20" y="190" class="t-sublbl">/Volumes/caisson</text>
+  <rect x="185" y="158" width="92.1" height="28" rx="4" fill="#14b8a6"/>
+  <rect x="277.1" y="158" width="17.7" height="28" rx="4" fill="#0f766e"/>
+  <text x="304.9" y="176" class="t-val" fill="#2dd4bf">10.22 s</text>
+  <rect x="370.865" y="162" width="102" height="20" rx="10" fill="#0d3b38" stroke="#14b8a6" stroke-width="1"/>
+  <text x="421.9" y="175.5" text-anchor="middle" class="t-pill" fill="#5eead4">-73.5% OS CPU</text>
+
+  <rect x="20" y="214" width="230" height="62" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="34" y="242" class="t-kpi">-73.5%</text>
+  <text x="34" y="261" class="t-kpi-lbl">Total Daemon CPU (38.58 s → 10.22 s)</text>
+  <rect x="265" y="214" width="230" height="62" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="279" y="242" class="t-kpi">-100.0%</text>
+  <text x="279" y="261" class="t-kpi-lbl">Spotlight mds_stores (1.58 s → 0.00 s)</text>
+  <rect x="510" y="214" width="230" height="62" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="524" y="242" class="t-kpi">-74.2%</text>
+  <text x="524" y="261" class="t-kpi-lbl">fseventsd CPU (33.27 s → 8.57 s)</text>
+</svg>
