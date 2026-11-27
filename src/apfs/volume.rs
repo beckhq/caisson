@@ -14,6 +14,7 @@ use crate::registry::{RegisteredVolume, VolumeMarker, VolumeRegistry, VolumeTier
 use crate::units::parse_size;
 use chrono::Utc;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -133,21 +134,27 @@ pub fn create_volume(
 ) -> Result<VolumeCreateReport> {
     validate_volume_name(&opts.name)?;
 
-    let apfs = list_apfs()?;
+    let apfs_before = list_apfs()?;
     let container = match opts.container {
-        Some(ref c_ref) => apfs
+        Some(ref c_ref) => apfs_before
             .find_container(c_ref)
             .cloned()
             .ok_or_else(|| CaissonError::Message(format!("APFS container '{c_ref}' not found")))?,
         None => detect_internal_container()?,
     };
 
-    if apfs.find_volume_by_name(&opts.name).is_some() {
+    if apfs_before.find_volume_by_name(&opts.name).is_some() {
         return Err(CaissonError::Message(format!(
             "APFS volume '{}' already exists; run `sudo caisson vol shield {}` to re-apply shields or choose another name",
             opts.name, opts.name
         )));
     }
+
+    let before_uuids: HashSet<String> = container
+        .volumes
+        .iter()
+        .map(|v| v.uuid.to_ascii_uppercase())
+        .collect();
 
     let quota_bytes = match opts.quota {
         QuotaSpec::Auto => compute_auto_quota(container.capacity_ceiling),
@@ -220,23 +227,63 @@ pub fn create_volume(
 
     execute_add_volume(&args)?;
 
-    // Re-read APFS plist structurally to capture the new volume's UUID and actual mount point.
+    // Identify the newly created volume unambiguously via container-scoped before/after UUID diff.
     let updated_apfs = list_apfs()?;
-    let (_, created_vol) = updated_apfs
-        .find_volume_by_name(&opts.name)
+    let updated_container = updated_apfs
+        .find_container(&container.container_reference)
         .ok_or_else(|| {
             CaissonError::Message(format!(
-                "created volume '{}' was not found in `diskutil apfs list -plist`",
-                opts.name
+                "APFS container '{}' disappeared after addVolume",
+                container.container_reference
             ))
         })?;
 
-    let actual_mount = diskutil_info(&created_vol.uuid)
-        .ok()
-        .and_then(|info| info.mount_point)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| mount_point.clone());
+    let new_matches: Vec<_> = updated_container
+        .volumes
+        .iter()
+        .filter(|v| {
+            !before_uuids.contains(&v.uuid.to_ascii_uppercase())
+                && v.name.as_deref() == Some(opts.name.as_str())
+        })
+        .collect();
+
+    let created_vol = match new_matches.as_slice() {
+        [only] => *only,
+        [] => {
+            return Err(CaissonError::Message(format!(
+                "newly created volume '{}' was not found in container '{}'",
+                opts.name, container.container_reference
+            )));
+        }
+        many => {
+            return Err(CaissonError::Message(format!(
+                "ambiguous creation result: {} new volumes named '{}' appeared in container '{}'",
+                many.len(),
+                opts.name,
+                container.container_reference
+            )));
+        }
+    };
+
+    // Require live mount confirmation before writing the on-volume ownership marker.
+    let live_info = diskutil_info(&created_vol.uuid)?;
+    let actual_mount_str = live_info
+        .mount_point
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            CaissonError::Message(format!(
+                "created volume '{}' ({}) did not report a live mount point; refusing to write marker to an unverified path",
+                opts.name, created_vol.uuid
+            ))
+        })?;
+    let actual_mount = fs::canonicalize(&actual_mount_str)?;
+    verify_mount_root_matches_uuid(&actual_mount, &created_vol.uuid)?;
+
+    let effective_quota = if created_vol.capacity_quota > 0 {
+        Some(created_vol.capacity_quota)
+    } else {
+        quota_bytes
+    };
 
     let registered = RegisteredVolume {
         name: opts.name.clone(),
@@ -246,17 +293,18 @@ pub fn create_volume(
         tier: opts.tier,
         case_sensitive: opts.case_sensitive,
         nobrowse: opts.nobrowse,
-        quota_bytes,
+        quota_bytes: effective_quota,
         owner: owner.clone(),
         created_at: Utc::now(),
     };
 
-    // Write on-volume ownership marker `.caisson-volume.json` and register immediately so even
-    // if a subsequent shield step warns or fails, the volume is tracked and cleanly removable.
+    // Write on-volume ownership marker `.caisson-volume.json` and register under advisory lock
+    // immediately so even if a subsequent shield step warns or fails, the volume is tracked.
     VolumeMarker::from_registered(&registered).write_to(&actual_mount)?;
-    let mut registry = VolumeRegistry::load_from(registry_path)?;
-    registry.upsert(registered);
-    registry.save_to(registry_path)?;
+    VolumeRegistry::with_locked_update(registry_path, |reg| {
+        reg.upsert(registered);
+        Ok(())
+    })?;
 
     // Initialize Tier-1 directories (`worktrees/`, `cache/`, `.trash/`)
     let mut created_dirs = Vec::new();
@@ -289,7 +337,7 @@ pub fn create_volume(
         container_capacity_bytes: container.capacity_ceiling,
         mount_point: actual_mount.display().to_string(),
         uuid: Some(created_vol.uuid.clone()),
-        quota_bytes,
+        quota_bytes: effective_quota,
         case_sensitive: opts.case_sensitive,
         nobrowse: opts.nobrowse,
         owner,
@@ -298,6 +346,42 @@ pub fn create_volume(
         shield_report,
         initialized_dirs: created_dirs,
     })
+}
+
+/// Verify that `mount_point` is an exact mounted APFS volume root matching `expected_uuid`.
+pub fn verify_mount_root_matches_uuid(mount_point: &Path, expected_uuid: &str) -> Result<()> {
+    let canonical_mp = fs::canonicalize(mount_point)?;
+    let mp_str = canonical_mp.to_string_lossy();
+    if mp_str == "/" || mp_str.starts_with("/System") {
+        return Err(CaissonError::Message(format!(
+            "refusing to operate on protected macOS system mount '{mp_str}'"
+        )));
+    }
+    let st = statfs_path(&canonical_mp)?;
+    let canonical_st =
+        fs::canonicalize(&st.mount_point).unwrap_or_else(|_| PathBuf::from(&st.mount_point));
+    if canonical_mp != canonical_st {
+        return Err(CaissonError::Message(format!(
+            "path '{}' is not a mounted volume root (mount root is '{}')",
+            canonical_mp.display(),
+            canonical_st.display()
+        )));
+    }
+    let info = diskutil_info(&mp_str)?;
+    let mounted_uuid = info
+        .volume_uuid
+        .as_deref()
+        .or(info.disk_uuid.as_deref())
+        .unwrap_or("");
+    if !mounted_uuid.eq_ignore_ascii_case(expected_uuid) {
+        return Err(CaissonError::Message(format!(
+            "mounted volume at '{}' has UUID '{}', expected '{}'",
+            canonical_mp.display(),
+            mounted_uuid,
+            expected_uuid
+        )));
+    }
+    Ok(())
 }
 
 /// List all Caisson-registered volumes enriched with live APFS & shield inspection data.
@@ -359,7 +443,10 @@ pub fn list_registered_volumes(registry_path: &Path) -> Result<Vec<VolumeStatusE
     Ok(entries)
 }
 
-/// Idempotently re-apply shields to a Caisson volume by name, UUID, or explicit mount path.
+/// Idempotently re-apply shields to a Caisson volume by name, UUID, or verified APFS mount path.
+///
+/// Always validates live APFS mount identity and unconditionally rejects protected system roles
+/// (`System`, `Data`, `VM`, `Preboot`, `Recovery`, etc.) and `/` or `/System/*`.
 pub fn shield_volume(
     target: &str,
     registry_path: &Path,
@@ -373,26 +460,79 @@ pub fn shield_volume(
     }
 
     let registry = VolumeRegistry::load_from(registry_path)?;
+    let apfs = list_apfs()?;
+
     let (mount_point, nobrowse, owner) = if let Some(vol) = registry
         .find_by_name(target)
         .or_else(|| registry.find_by_uuid(target))
     {
-        let live_mount = diskutil_info(&vol.uuid)
-            .ok()
-            .and_then(|info| info.mount_point)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| vol.mount_point.clone());
+        let (_, live_vol) = apfs.find_volume_by_uuid(&vol.uuid).ok_or_else(|| {
+            CaissonError::Message(format!(
+                "registered volume '{}' ({}) not found in live APFS list",
+                vol.name, vol.uuid
+            ))
+        })?;
+        if let Some(role) = live_vol.has_protected_role() {
+            return Err(CaissonError::Message(format!(
+                "refusing to shield volume '{}' with protected APFS role '{role}'",
+                vol.name
+            )));
+        }
+        let live_mount = diskutil_info(&vol.uuid)?
+            .mount_point
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                CaissonError::Message(format!(
+                    "volume '{}' ({}) is not currently mounted; mount it before shielding",
+                    vol.name, vol.uuid
+                ))
+            })?;
+        let mp = fs::canonicalize(&live_mount)?;
+        verify_mount_root_matches_uuid(&mp, &vol.uuid)?;
+
+        // Verify on-volume ownership marker matches registered UUID.
+        let marker = VolumeMarker::read_from(&mp)?;
+        if marker.managed_by != "caisson" || !marker.uuid.eq_ignore_ascii_case(&vol.uuid) {
+            return Err(CaissonError::Message(format!(
+                "on-volume marker at '{}' does not match registered UUID '{}'",
+                mp.display(),
+                vol.uuid
+            )));
+        }
+
         (
-            PathBuf::from(live_mount),
+            mp,
             nobrowse_override.unwrap_or(vol.nobrowse),
             vol.owner.clone().or_else(invoking_user),
         )
     } else if Path::new(target).is_absolute() {
-        (
-            PathBuf::from(target),
-            nobrowse_override.unwrap_or(false),
-            invoking_user(),
-        )
+        let mp = fs::canonicalize(target)?;
+        let mp_str = mp.to_string_lossy();
+        if mp_str == "/" || mp_str.starts_with("/System") {
+            return Err(CaissonError::Message(format!(
+                "refusing to shield protected macOS system mount '{mp_str}'"
+            )));
+        }
+        let info = diskutil_info(&mp_str)?;
+        let uuid = info
+            .volume_uuid
+            .as_deref()
+            .or(info.disk_uuid.as_deref())
+            .ok_or_else(|| {
+                CaissonError::Message(format!("could not resolve APFS volume UUID for '{mp_str}'"))
+            })?;
+        verify_mount_root_matches_uuid(&mp, uuid)?;
+        let (_, live_vol) = apfs.find_volume_by_uuid(uuid).ok_or_else(|| {
+            CaissonError::Message(format!(
+                "path '{mp_str}' is not an APFS volume listed by `diskutil apfs list`"
+            ))
+        })?;
+        if let Some(role) = live_vol.has_protected_role() {
+            return Err(CaissonError::Message(format!(
+                "refusing to shield APFS volume '{mp_str}' with protected system role '{role}'"
+            )));
+        }
+        (mp, nobrowse_override.unwrap_or(false), invoking_user())
     } else {
         return Err(CaissonError::VolumeNotFound(target.to_string()));
     };
@@ -408,26 +548,30 @@ pub fn shield_volume(
 }
 
 /// Destroy a Caisson-managed volume after unconditionally enforcing the triple-check safety guard.
+///
+/// When interactive confirmation is used, re-verifies live APFS state, mount identity, protected
+/// role, and on-volume marker immediately AFTER confirmation to prevent swap attacks during prompt.
 pub fn destroy_volume(
     target: &str,
     registry_path: &Path,
     yes: bool,
     dry_run: bool,
 ) -> Result<VolumeDestroyReport> {
-    let mut registry = VolumeRegistry::load_from(registry_path)?;
-    let apfs = list_apfs()?;
+    let run_live_verification = || -> Result<crate::apfs::diskutil::VerifiedDestroyTarget> {
+        let registry = VolumeRegistry::load_from(registry_path)?;
+        let apfs = list_apfs()?;
+        let live_mount = registry
+            .find_by_name(target)
+            .or_else(|| registry.find_by_uuid(target))
+            .and_then(|reg| diskutil_info(&reg.uuid).ok())
+            .and_then(|info| info.mount_point)
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from);
+        verify_destroy_safety(target, &registry, &apfs, live_mount.as_deref(), true)
+    };
 
-    // Resolve live mount point if registered
-    let live_mount = registry
-        .find_by_name(target)
-        .or_else(|| registry.find_by_uuid(target))
-        .and_then(|reg| diskutil_info(&reg.uuid).ok())
-        .and_then(|info| info.mount_point)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
-
-    // Unconditional triple-check safety guard (ARCHITECTURE.md §6)
-    let verified = verify_destroy_safety(target, &registry, &apfs, live_mount.as_deref())?;
+    // Pre-confirmation triple-check safety guard (ARCHITECTURE.md §6)
+    let mut verified = run_live_verification()?;
     let cmd = format!("diskutil apfs deleteVolume {}", verified.registered.uuid);
 
     if dry_run {
@@ -444,6 +588,19 @@ pub fn destroy_volume(
 
     if !yes {
         confirm_destroy_interactive(&verified.registered.name, &verified.registered.uuid)?;
+        // Re-verify live state, mount root identity, role, and marker immediately after prompt.
+        let rechecked = run_live_verification()?;
+        if !rechecked
+            .registered
+            .uuid
+            .eq_ignore_ascii_case(&verified.registered.uuid)
+        {
+            return Err(CaissonError::DestroySafetyViolation {
+                volume: target.to_string(),
+                reason: "target volume identity changed during confirmation prompt".to_string(),
+            });
+        }
+        verified = rechecked;
     }
 
     if !is_root() {
@@ -452,9 +609,12 @@ pub fn destroy_volume(
         });
     }
 
-    execute_delete_volume(&verified.registered.uuid)?;
-    registry.remove_by_uuid(&verified.registered.uuid);
-    registry.save_to(registry_path)?;
+    let target_uuid = verified.registered.uuid.clone();
+    execute_delete_volume(&target_uuid)?;
+    VolumeRegistry::with_locked_update(registry_path, |reg| {
+        reg.remove_by_uuid(&target_uuid);
+        Ok(())
+    })?;
 
     Ok(VolumeDestroyReport {
         name: verified.registered.name,
@@ -463,7 +623,7 @@ pub fn destroy_volume(
         mount_point: verified.mount_point.display().to_string(),
         dry_run: false,
         safety_verified: true,
-        command: cmd,
+        command: format!("diskutil apfs deleteVolume {target_uuid}"),
     })
 }
 
@@ -545,5 +705,13 @@ mod tests {
         assert!(report.diskutil_command.contains("caisson-dryrun-test"));
         assert_eq!(report.initialized_dirs.len(), 3);
         assert!(!reg_path.exists());
+    }
+
+    #[test]
+    fn shield_volume_rejects_system_mounts_even_in_dry_run() {
+        let dir = tempdir().unwrap();
+        let reg_path = dir.path().join("registry.json");
+        assert!(shield_volume("/", &reg_path, None, true).is_err());
+        assert!(shield_volume("/System/Volumes/Data", &reg_path, None, true).is_err());
     }
 }

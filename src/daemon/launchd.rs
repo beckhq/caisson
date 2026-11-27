@@ -1,24 +1,27 @@
 use crate::apfs::diskutil::{diskutil_info, execute_mount_volume, list_apfs};
 use crate::apfs::shield::{apply_shields, ShieldApplyReport, ShieldOptions};
 use crate::apfs::statfs::is_root;
+use crate::apfs::volume::verify_mount_root_matches_uuid;
 use crate::error::{CaissonError, Result};
-use crate::registry::VolumeRegistry;
+use crate::registry::{VolumeMarker, VolumeRegistry};
 use plist::{Dictionary, Value};
 use serde::Serialize;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const LAUNCH_DAEMON_LABEL: &str = "dev.caisson.mount";
 pub const LAUNCH_DAEMON_PLIST_PATH: &str = "/Library/LaunchDaemons/dev.caisson.mount.plist";
 pub const LAUNCH_DAEMON_LOG_PATH: &str = "/var/log/caisson-mount.log";
+pub const LAUNCH_DAEMON_BIN_PATH: &str = "/Library/Application Support/caisson/bin/caisson";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DaemonActionReport {
     pub action: String,
     pub label: String,
     pub plist_path: String,
+    pub executable_path: Option<String>,
     pub dry_run: bool,
     pub commands: Vec<String>,
     pub plist_xml: Option<String>,
@@ -47,6 +50,12 @@ pub struct MountAllVolumeResult {
 pub struct MountAllReport {
     pub dry_run: bool,
     pub volumes: Vec<MountAllVolumeResult>,
+}
+
+impl MountAllReport {
+    pub fn has_errors(&self) -> bool {
+        self.volumes.iter().any(|v| v.error.is_some())
+    }
 }
 
 /// Generate the auditable one-shot LaunchDaemon plist XML (`ARCHITECTURE.md` §4).
@@ -82,27 +91,166 @@ pub fn generate_plist_xml(caisson_bin: &Path) -> Result<String> {
     Ok(xml)
 }
 
+/// Validate that `bin_path` is an absolute, canonical regular file owned by root (`uid == 0`),
+/// not writable by group/other, and that every ancestor directory up to `/` is also owned by root
+/// and not writable by group/other (preventing non-root privilege escalation via boot launchd).
+pub fn validate_root_owned_executable(bin_path: &Path) -> Result<PathBuf> {
+    if !bin_path.is_absolute() {
+        return Err(CaissonError::Message(format!(
+            "LaunchDaemon executable path must be absolute: '{}'",
+            bin_path.display()
+        )));
+    }
+    let canonical = fs::canonicalize(bin_path)?;
+    let meta = fs::symlink_metadata(&canonical)?;
+    if !meta.is_file() {
+        return Err(CaissonError::Message(format!(
+            "LaunchDaemon executable '{}' is not a regular file",
+            canonical.display()
+        )));
+    }
+    if meta.uid() != 0 {
+        return Err(CaissonError::Message(format!(
+            "refusing to run non-root-owned executable '{}' as a root LaunchDaemon (owner uid={}); omit `--bin` so Caisson installs a root-owned copy to `{LAUNCH_DAEMON_BIN_PATH}`",
+            canonical.display(),
+            meta.uid()
+        )));
+    }
+    if (meta.mode() & 0o022) != 0 {
+        return Err(CaissonError::Message(format!(
+            "refusing to run group/world-writable executable '{}' as a root LaunchDaemon (mode {:o})",
+            canonical.display(),
+            meta.mode() & 0o7777
+        )));
+    }
+
+    // Walk every ancestor directory up to `/` and confirm root ownership & no group/world write.
+    let mut cur = canonical.parent();
+    while let Some(dir) = cur {
+        let dir_meta = fs::symlink_metadata(dir)?;
+        if dir_meta.uid() != 0 {
+            return Err(CaissonError::Message(format!(
+                "refusing to run LaunchDaemon executable beneath non-root-owned directory '{}' (uid={})",
+                dir.display(),
+                dir_meta.uid()
+            )));
+        }
+        // Note: on macOS `/Library` and `/Library/Application Support` have `root:admin` mode 0755
+        // (or sticky bit), so reject group/world write (`0o022`) unless sticky is NOT sufficient.
+        if (dir_meta.mode() & 0o022) != 0 {
+            return Err(CaissonError::Message(format!(
+                "refusing to run LaunchDaemon executable beneath group/world-writable directory '{}' (mode {:o})",
+                dir.display(),
+                dir_meta.mode() & 0o7777
+            )));
+        }
+        cur = dir.parent();
+    }
+
+    Ok(canonical)
+}
+
+/// Install a dedicated root-owned copy of `source_bin` into `dest_bin` (`root:wheel`, `0755`)
+/// with root-owned `0755` parent directories.
+fn install_root_binary_copy(source_bin: &Path, dest_bin: &Path) -> Result<PathBuf> {
+    let canonical_src = fs::canonicalize(source_bin)?;
+    let parent = dest_bin.parent().ok_or_else(|| {
+        CaissonError::Message(format!(
+            "invalid daemon binary path: {}",
+            dest_bin.display()
+        ))
+    })?;
+    fs::create_dir_all(parent)?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o755))?;
+    let parent_str = parent.display().to_string();
+    let _ = Command::new("chown")
+        .args(["root:wheel", &parent_str])
+        .output();
+
+    // Also harden `/Library/Application Support/caisson` itself.
+    if let Some(grandparent) = parent.parent() {
+        if grandparent.file_name().and_then(|s| s.to_str()) == Some("caisson") {
+            let _ = fs::set_permissions(grandparent, fs::Permissions::from_mode(0o755));
+            let _ = Command::new("chown")
+                .args(["root:wheel", &grandparent.display().to_string()])
+                .output();
+        }
+    }
+
+    let tmp = parent.join(format!(".caisson.{}.tmp", std::process::id()));
+    fs::copy(&canonical_src, &tmp)?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
+    let tmp_str = tmp.display().to_string();
+    let chown = Command::new("chown")
+        .args(["root:wheel", &tmp_str])
+        .output()?;
+    if !chown.status.success() {
+        let _ = fs::remove_file(&tmp);
+        return Err(CaissonError::CommandFailed {
+            cmd: format!("chown root:wheel {tmp_str}"),
+            code: chown.status.code(),
+            stderr: String::from_utf8_lossy(&chown.stderr).trim().to_string(),
+        });
+    }
+    fs::rename(&tmp, dest_bin)?;
+    validate_root_owned_executable(dest_bin)
+}
+
 /// Install and bootstrap `/Library/LaunchDaemons/dev.caisson.mount.plist`.
+///
+/// When `explicit_bin` is `None`, installs a dedicated root-owned copy of the current binary at
+/// `/Library/Application Support/caisson/bin/caisson` so launchd never executes a user-replaceable
+/// binary (e.g. under Homebrew or `~/.cargo/bin`). When `explicit_bin` is `Some(path)`, validates
+/// that `path` and every ancestor directory are root-owned and not writable by unprivileged users.
 pub fn install_daemon(
-    caisson_bin: &Path,
+    explicit_bin: Option<&Path>,
     plist_path: &Path,
     dry_run: bool,
 ) -> Result<DaemonActionReport> {
-    let xml = generate_plist_xml(caisson_bin)?;
     let plist_str = plist_path.display().to_string();
-    let commands = vec![
+    let (target_bin, mut commands) = match explicit_bin {
+        Some(p) => {
+            if !dry_run {
+                let validated = validate_root_owned_executable(p)?;
+                (validated, Vec::new())
+            } else {
+                let canonical = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                (
+                    canonical.clone(),
+                    vec![format!(
+                        "verify root-owned non-writable executable {}",
+                        canonical.display()
+                    )],
+                )
+            }
+        }
+        None => {
+            let current = std::env::current_exe()?;
+            let dest = PathBuf::from(LAUNCH_DAEMON_BIN_PATH);
+            let cmds = vec![format!(
+                "install -o root -g wheel -m 0755 {} {}",
+                current.display(),
+                dest.display()
+            )];
+            (dest, cmds)
+        }
+    };
+
+    let xml = generate_plist_xml(&target_bin)?;
+    commands.extend([
         format!("write {plist_str}"),
         format!("chmod 0644 {plist_str}"),
         format!("chown root:wheel {plist_str}"),
         format!("launchctl bootout system/{LAUNCH_DAEMON_LABEL} || true"),
         format!("launchctl bootstrap system {plist_str}"),
-    ];
+    ]);
 
     if dry_run {
         return Ok(DaemonActionReport {
             action: "install".to_string(),
             label: LAUNCH_DAEMON_LABEL.to_string(),
             plist_path: plist_str,
+            executable_path: Some(target_bin.display().to_string()),
             dry_run: true,
             commands,
             plist_xml: Some(xml),
@@ -115,10 +263,19 @@ pub fn install_daemon(
         });
     }
 
+    let final_bin = match explicit_bin {
+        Some(p) => validate_root_owned_executable(p)?,
+        None => {
+            let current = std::env::current_exe()?;
+            install_root_binary_copy(&current, Path::new(LAUNCH_DAEMON_BIN_PATH))?
+        }
+    };
+    let final_xml = generate_plist_xml(&final_bin)?;
+
     if let Some(parent) = plist_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(plist_path, &xml)?;
+    fs::write(plist_path, &final_xml)?;
     fs::set_permissions(plist_path, fs::Permissions::from_mode(0o644))?;
 
     let chown = Command::new("chown")
@@ -132,7 +289,6 @@ pub fn install_daemon(
         });
     }
 
-    // Bootout previous registration if present (ignore non-zero if not loaded).
     let _ = Command::new("launchctl")
         .args(["bootout", &format!("system/{LAUNCH_DAEMON_LABEL}")])
         .output();
@@ -154,9 +310,10 @@ pub fn install_daemon(
         action: "install".to_string(),
         label: LAUNCH_DAEMON_LABEL.to_string(),
         plist_path: plist_str,
+        executable_path: Some(final_bin.display().to_string()),
         dry_run: false,
         commands,
-        plist_xml: Some(xml),
+        plist_xml: Some(final_xml),
     })
 }
 
@@ -173,6 +330,7 @@ pub fn uninstall_daemon(plist_path: &Path, dry_run: bool) -> Result<DaemonAction
             action: "uninstall".to_string(),
             label: LAUNCH_DAEMON_LABEL.to_string(),
             plist_path: plist_str,
+            executable_path: None,
             dry_run: true,
             commands,
             plist_xml: None,
@@ -197,6 +355,7 @@ pub fn uninstall_daemon(plist_path: &Path, dry_run: bool) -> Result<DaemonAction
         action: "uninstall".to_string(),
         label: LAUNCH_DAEMON_LABEL.to_string(),
         plist_path: plist_str,
+        executable_path: None,
         dry_run: false,
         commands,
         plist_xml: None,
@@ -242,6 +401,9 @@ pub fn daemon_status(plist_path: &Path) -> DaemonStatus {
 }
 
 /// Re-mount registered Caisson volumes if unmounted and re-apply `noatime` / `nobrowse` shields.
+///
+/// Validates live mount identity, protected roles, and `.caisson-volume.json` UUID marker before
+/// applying shields, and never falls back to a stale stored mount path.
 pub fn mount_all(registry_path: &Path, dry_run: bool) -> Result<MountAllReport> {
     if !dry_run && !is_root() {
         return Err(CaissonError::RequiresRoot {
@@ -250,62 +412,130 @@ pub fn mount_all(registry_path: &Path, dry_run: bool) -> Result<MountAllReport> 
     }
 
     let registry = VolumeRegistry::load_from(registry_path)?;
-    let apfs = list_apfs().ok();
+    let apfs = list_apfs()?;
     let mut results = Vec::new();
 
     for vol in &registry.volumes {
-        let mut mounted_action = "already-mounted".to_string();
-        let mut mount_point = PathBuf::from(&vol.mount_point);
+        let Some((_, live_vol)) = apfs.find_volume_by_uuid(&vol.uuid) else {
+            results.push(MountAllVolumeResult {
+                name: vol.name.clone(),
+                uuid: vol.uuid.clone(),
+                mount_point: vol.mount_point.clone(),
+                mounted_action: "missing".to_string(),
+                shield_report: None,
+                error: Some(format!("volume UUID {} not found on system", vol.uuid)),
+            });
+            continue;
+        };
 
-        // Check live mount point via diskutil info -plist <uuid>
+        if let Some(role) = live_vol.has_protected_role() {
+            results.push(MountAllVolumeResult {
+                name: vol.name.clone(),
+                uuid: vol.uuid.clone(),
+                mount_point: vol.mount_point.clone(),
+                mounted_action: "rejected".to_string(),
+                shield_report: None,
+                error: Some(format!(
+                    "refusing to mount/shield volume with protected APFS role '{role}'"
+                )),
+            });
+            continue;
+        }
+
+        let mut mounted_action = "already-mounted".to_string();
         let live_mount = diskutil_info(&vol.uuid)
             .ok()
             .and_then(|info| info.mount_point)
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.trim().is_empty());
 
-        if let Some(mp) = live_mount {
-            mount_point = PathBuf::from(mp);
-        } else {
-            // Check whether volume exists at all in APFS list before attempting mount
-            let exists_in_apfs = apfs
-                .as_ref()
-                .map(|a| a.find_volume_by_uuid(&vol.uuid).is_some())
-                .unwrap_or(true);
-            if !exists_in_apfs {
+        let mount_point = match live_mount {
+            Some(mp) => PathBuf::from(mp),
+            None => {
+                if dry_run {
+                    mounted_action = format!("planned: diskutil mount {}", vol.uuid);
+                    PathBuf::from(&vol.mount_point)
+                } else {
+                    match execute_mount_volume(&vol.uuid) {
+                        Ok(_) => {
+                            mounted_action = "mounted".to_string();
+                            match diskutil_info(&vol.uuid)
+                                .ok()
+                                .and_then(|info| info.mount_point)
+                                .filter(|s| !s.trim().is_empty())
+                            {
+                                Some(mp) => PathBuf::from(mp),
+                                None => {
+                                    results.push(MountAllVolumeResult {
+                                        name: vol.name.clone(),
+                                        uuid: vol.uuid.clone(),
+                                        mount_point: vol.mount_point.clone(),
+                                        mounted_action: "mount-unverified".to_string(),
+                                        shield_report: None,
+                                        error: Some(format!(
+                                            "diskutil mount succeeded for {} but no live mount point was reported",
+                                            vol.uuid
+                                        )),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            results.push(MountAllVolumeResult {
+                                name: vol.name.clone(),
+                                uuid: vol.uuid.clone(),
+                                mount_point: vol.mount_point.clone(),
+                                mounted_action: "mount-failed".to_string(),
+                                shield_report: None,
+                                error: Some(e.to_string()),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+        };
+
+        if !dry_run {
+            if let Err(e) = verify_mount_root_matches_uuid(&mount_point, &vol.uuid) {
                 results.push(MountAllVolumeResult {
                     name: vol.name.clone(),
                     uuid: vol.uuid.clone(),
-                    mount_point: vol.mount_point.clone(),
-                    mounted_action: "missing".to_string(),
+                    mount_point: mount_point.display().to_string(),
+                    mounted_action,
                     shield_report: None,
-                    error: Some(format!("volume UUID {} not found on system", vol.uuid)),
+                    error: Some(e.to_string()),
                 });
                 continue;
             }
-
-            if dry_run {
-                mounted_action = format!("planned: diskutil mount {}", vol.uuid);
-            } else {
-                match execute_mount_volume(&vol.uuid) {
-                    Ok(_) => {
-                        mounted_action = "mounted".to_string();
-                        if let Ok(info) = diskutil_info(&vol.uuid) {
-                            if let Some(mp) = info.mount_point.filter(|s| !s.is_empty()) {
-                                mount_point = PathBuf::from(mp);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        results.push(MountAllVolumeResult {
-                            name: vol.name.clone(),
-                            uuid: vol.uuid.clone(),
-                            mount_point: vol.mount_point.clone(),
-                            mounted_action: "mount-failed".to_string(),
-                            shield_report: None,
-                            error: Some(e.to_string()),
-                        });
-                        continue;
-                    }
+            match VolumeMarker::read_from(&mount_point) {
+                Ok(marker)
+                    if marker.managed_by == "caisson"
+                        && marker.uuid.eq_ignore_ascii_case(&vol.uuid) => {}
+                Ok(marker) => {
+                    results.push(MountAllVolumeResult {
+                        name: vol.name.clone(),
+                        uuid: vol.uuid.clone(),
+                        mount_point: mount_point.display().to_string(),
+                        mounted_action,
+                        shield_report: None,
+                        error: Some(format!(
+                            "on-volume marker mismatch (managed_by={}, uuid={})",
+                            marker.managed_by, marker.uuid
+                        )),
+                    });
+                    continue;
+                }
+                Err(e) => {
+                    results.push(MountAllVolumeResult {
+                        name: vol.name.clone(),
+                        uuid: vol.uuid.clone(),
+                        mount_point: mount_point.display().to_string(),
+                        mounted_action,
+                        shield_report: None,
+                        error: Some(format!("failed to verify on-volume marker: {e}")),
+                    });
+                    continue;
                 }
             }
         }
@@ -348,7 +578,7 @@ mod tests {
 
     #[test]
     fn generates_valid_one_shot_launchd_plist() {
-        let xml = generate_plist_xml(Path::new("/usr/local/bin/caisson")).unwrap();
+        let xml = generate_plist_xml(Path::new(LAUNCH_DAEMON_BIN_PATH)).unwrap();
         let val = Value::from_reader_xml(xml.as_bytes()).unwrap();
         let dict = val.as_dictionary().unwrap();
 
@@ -371,7 +601,16 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_string())
             .collect();
-        assert_eq!(args, vec!["/usr/local/bin/caisson", "mount-all"]);
+        assert_eq!(args, vec![LAUNCH_DAEMON_BIN_PATH, "mount-all"]);
+    }
+
+    #[test]
+    fn rejects_non_root_owned_executable_for_launch_daemon() {
+        let dir = tempdir().unwrap();
+        let fake_bin = dir.path().join("caisson");
+        fs::write(&fake_bin, "#!/bin/sh\n").unwrap();
+        let err = validate_root_owned_executable(&fake_bin).unwrap_err();
+        assert!(err.to_string().contains("non-root-owned"));
     }
 
     #[test]
@@ -379,9 +618,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let plist_path = dir.path().join("dev.caisson.mount.plist");
 
-        let install =
-            install_daemon(Path::new("/usr/local/bin/caisson"), &plist_path, true).unwrap();
+        let install = install_daemon(None, &plist_path, true).unwrap();
         assert!(install.dry_run);
+        assert_eq!(
+            install.executable_path.as_deref(),
+            Some(LAUNCH_DAEMON_BIN_PATH)
+        );
         assert!(install.plist_xml.is_some());
         assert!(!plist_path.exists());
 
@@ -399,14 +641,14 @@ mod tests {
         assert!(!missing.installed);
         assert!(missing.program_arguments.is_empty());
 
-        let xml = generate_plist_xml(Path::new("/opt/homebrew/bin/caisson")).unwrap();
+        let xml = generate_plist_xml(Path::new(LAUNCH_DAEMON_BIN_PATH)).unwrap();
         fs::write(&plist_path, xml).unwrap();
 
         let present = daemon_status(&plist_path);
         assert!(present.installed);
         assert_eq!(
             present.program_arguments,
-            vec!["/opt/homebrew/bin/caisson", "mount-all"]
+            vec![LAUNCH_DAEMON_BIN_PATH, "mount-all"]
         );
     }
 }

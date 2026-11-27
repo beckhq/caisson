@@ -329,11 +329,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             let plist_path = Path::new(LAUNCH_DAEMON_PLIST_PATH);
             match action {
                 DaemonCommands::Install { bin, dry_run } => {
-                    let bin_path = match bin {
-                        Some(p) => p,
-                        None => std::env::current_exe()?,
-                    };
-                    let report = install_daemon(&bin_path, plist_path, dry_run)?;
+                    let report = install_daemon(bin.as_deref(), plist_path, dry_run)?;
                     if json {
                         print_json(&report)?;
                     } else {
@@ -399,6 +395,11 @@ fn dispatch(cli: Cli) -> Result<()> {
                         }
                     }
                 }
+            }
+            if report.has_errors() {
+                return Err(CaissonError::Message(
+                    "one or more volumes failed during `mount-all`".to_string(),
+                ));
             }
         }
 
@@ -469,6 +470,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             watch_pid,
             post_settle,
             summarize,
+            append,
         } => {
             let (summary, summary_path) = run_watch(&WatchOptions {
                 label,
@@ -477,6 +479,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 watch_pid,
                 post_settle_secs: post_settle,
                 summarize,
+                append,
             })?;
             if json || summary_path.is_none() {
                 print_json(&summary)?;
@@ -572,6 +575,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                             }
                             if e.unpushed {
                                 flags.push("unpushed");
+                            }
+                            if e.inspection_failed {
+                                flags.push("unknown");
                             }
                             if e.orphaned {
                                 flags.push("orphaned");

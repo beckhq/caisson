@@ -69,6 +69,11 @@ fn privileged_apfs_create_shield_and_destroy_roundtrip() {
     let mut guard = TempApfsVolumeGuard::new(vol_name.clone(), reg_path.clone());
 
     assert!(created.uuid.is_some());
+    assert_eq!(
+        created.quota_bytes,
+        Some(5 * caisson::units::GIB),
+        "live APFS quota should match exact requested binary GiB bytes"
+    );
     let mp = Path::new(&created.mount_point);
     assert!(
         mp.exists(),

@@ -337,13 +337,16 @@ pub struct VerifiedDestroyTarget {
 /// 1. Target volume UUID must exist in Caisson's registry.
 /// 2. Live APFS volume must exist and MUST NOT carry any system/protected APFS role
 ///    (`System`, `Data`, `VM`, `Preboot`, `Recovery`, etc.) or mount at `/` or `/System/*`.
-/// 3. The mounted volume root MUST contain `.caisson-volume.json` with `managed_by == "caisson"`
-///    and an exact UUID match to the registered volume.
+/// 3. The volume MUST be currently mounted (never falls back to a stale stored path), and when
+///    `verify_live_mount_identity` is true, its mount path MUST be the exact canonical mount root
+///    whose live `diskutil info` UUID matches `registered.uuid`. Its on-volume `.caisson-volume.json`
+///    marker (read strictly with `O_NOFOLLOW`) MUST have `managed_by == "caisson"` and an exact UUID match.
 pub fn verify_destroy_safety(
     target: &str,
     registry: &VolumeRegistry,
     apfs_list: &ApfsListPlist,
-    resolved_mount_point: Option<&Path>,
+    live_mount_point: Option<&Path>,
+    verify_live_mount_identity: bool,
 ) -> Result<VerifiedDestroyTarget> {
     // Check 1: Registry presence
     let registered = registry
@@ -377,11 +380,17 @@ pub fn verify_destroy_safety(
         });
     }
 
-    // Resolve mount point for Check 3
-    let mount_point = resolved_mount_point
+    // Check 3a: Require a live mounted volume root (never fall back to a stale stored directory).
+    let mount_point = live_mount_point
         .map(Path::to_path_buf)
         .or_else(|| live_volume.mount_point.as_ref().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(&registered.mount_point));
+        .ok_or_else(|| CaissonError::DestroySafetyViolation {
+            volume: target.to_string(),
+            reason: format!(
+                "volume '{}' ({}) is not currently mounted; mount it first (`diskutil mount {}`) so Caisson can verify its on-volume ownership marker",
+                registered.name, registered.uuid, registered.uuid
+            ),
+        })?;
 
     let mp_str = mount_point.to_string_lossy();
     if mp_str == "/" || mp_str.starts_with("/System") {
@@ -393,9 +402,64 @@ pub fn verify_destroy_safety(
         });
     }
 
-    // Check 3: On-volume `.caisson-volume.json` UUID ownership marker
+    if verify_live_mount_identity {
+        let canonical_mp = std::fs::canonicalize(&mount_point).map_err(|e| {
+            CaissonError::DestroySafetyViolation {
+                volume: target.to_string(),
+                reason: format!(
+                    "failed to canonicalize live mount point '{}': {e}",
+                    mount_point.display()
+                ),
+            }
+        })?;
+        let st = crate::apfs::statfs::statfs_path(&canonical_mp).map_err(|e| {
+            CaissonError::DestroySafetyViolation {
+                volume: target.to_string(),
+                reason: format!("statfs failed on '{}': {e}", canonical_mp.display()),
+            }
+        })?;
+        let canonical_statfs_mp = std::fs::canonicalize(&st.mount_point)
+            .unwrap_or_else(|_| PathBuf::from(&st.mount_point));
+        if canonical_mp != canonical_statfs_mp {
+            return Err(CaissonError::DestroySafetyViolation {
+                volume: target.to_string(),
+                reason: format!(
+                    "path '{}' is not a mounted volume root (actual mount root is '{}')",
+                    canonical_mp.display(),
+                    canonical_statfs_mp.display()
+                ),
+            });
+        }
+        let mp_info = diskutil_info(&canonical_mp.to_string_lossy()).map_err(|e| {
+            CaissonError::DestroySafetyViolation {
+                volume: target.to_string(),
+                reason: format!(
+                    "could not verify live volume identity at '{}': {e}",
+                    canonical_mp.display()
+                ),
+            }
+        })?;
+        let mounted_uuid = mp_info
+            .volume_uuid
+            .as_deref()
+            .or(mp_info.disk_uuid.as_deref())
+            .unwrap_or("");
+        if !mounted_uuid.eq_ignore_ascii_case(&registered.uuid) {
+            return Err(CaissonError::DestroySafetyViolation {
+                volume: target.to_string(),
+                reason: format!(
+                    "volume mounted at '{}' has UUID '{}', expected registered UUID '{}'",
+                    canonical_mp.display(),
+                    mounted_uuid,
+                    registered.uuid
+                ),
+            });
+        }
+    }
+
+    // Check 3b: On-volume `.caisson-volume.json` UUID ownership marker (read strictly with O_NOFOLLOW)
     let marker_path = VolumeMarker::path_for(&mount_point);
-    if !marker_path.exists() {
+    if std::fs::symlink_metadata(&marker_path).is_err() {
         return Err(CaissonError::DestroySafetyViolation {
             volume: target.to_string(),
             reason: format!(
@@ -409,7 +473,7 @@ pub fn verify_destroy_safety(
         CaissonError::DestroySafetyViolation {
             volume: target.to_string(),
             reason: format!(
-                "failed to parse ownership marker '{}': {e}",
+                "failed to verify ownership marker '{}': {e}",
                 marker_path.display()
             ),
         }
@@ -724,7 +788,7 @@ mod tests {
                 "-mountpoint",
                 "/Volumes/chromium-bench",
                 "-quota",
-                "300g",
+                "322122547200B",
             ]
         );
     }
@@ -744,10 +808,27 @@ mod tests {
             .write_to(mount_dir.path())
             .unwrap();
 
-        let verified = verify_destroy_safety("caisson", &reg, &apfs, Some(mount_dir.path()))
+        let verified = verify_destroy_safety("caisson", &reg, &apfs, Some(mount_dir.path()), false)
             .expect("all three safety checks should pass");
         assert_eq!(verified.registered.uuid, vol.uuid);
         assert_eq!(verified.live_volume.device_identifier, "disk3s7");
+
+        // Unmounted volume MUST be refused even if stored mount_point still has a marker file.
+        let unmounted = verify_destroy_safety("caisson", &reg, &apfs, None, false).unwrap_err();
+        assert!(matches!(
+            unmounted,
+            CaissonError::DestroySafetyViolation { .. }
+        ));
+        assert!(unmounted.to_string().contains("not currently mounted"));
+
+        // A non-mount-root directory MUST be refused when live mount verification is enabled.
+        let non_root = verify_destroy_safety("caisson", &reg, &apfs, Some(mount_dir.path()), true)
+            .unwrap_err();
+        assert!(matches!(
+            non_root,
+            CaissonError::DestroySafetyViolation { .. }
+        ));
+        assert!(non_root.to_string().contains("not a mounted volume root"));
     }
 
     #[test]
@@ -756,8 +837,8 @@ mod tests {
         let mount_dir = tempdir().unwrap();
         let reg = VolumeRegistry::default();
 
-        let err =
-            verify_destroy_safety("caisson", &reg, &apfs, Some(mount_dir.path())).unwrap_err();
+        let err = verify_destroy_safety("caisson", &reg, &apfs, Some(mount_dir.path()), false)
+            .unwrap_err();
         assert!(matches!(err, CaissonError::DestroySafetyViolation { .. }));
         assert!(err
             .to_string()
@@ -776,8 +857,8 @@ mod tests {
         let mut reg = VolumeRegistry::default();
         reg.upsert(vol);
 
-        let err =
-            verify_destroy_safety("caisson", &reg, &apfs, Some(mount_dir.path())).unwrap_err();
+        let err = verify_destroy_safety("caisson", &reg, &apfs, Some(mount_dir.path()), false)
+            .unwrap_err();
         assert!(matches!(err, CaissonError::DestroySafetyViolation { .. }));
         assert!(err
             .to_string()
@@ -800,8 +881,8 @@ mod tests {
         wrong_marker.uuid = "99999999-9999-9999-9999-999999999999".to_string();
         wrong_marker.write_to(mount_dir.path()).unwrap();
 
-        let err =
-            verify_destroy_safety("caisson", &reg, &apfs, Some(mount_dir.path())).unwrap_err();
+        let err = verify_destroy_safety("caisson", &reg, &apfs, Some(mount_dir.path()), false)
+            .unwrap_err();
         assert!(matches!(err, CaissonError::DestroySafetyViolation { .. }));
         assert!(err.to_string().contains("does not match registered UUID"));
     }
@@ -820,16 +901,16 @@ mod tests {
 
         // Corrupt JSON
         fs::write(VolumeMarker::path_for(mount_dir.path()), "not-json").unwrap();
-        let err =
-            verify_destroy_safety("caisson", &reg, &apfs, Some(mount_dir.path())).unwrap_err();
+        let err = verify_destroy_safety("caisson", &reg, &apfs, Some(mount_dir.path()), false)
+            .unwrap_err();
         assert!(matches!(err, CaissonError::DestroySafetyViolation { .. }));
 
         // Wrong managed_by
         let mut foreign = VolumeMarker::from_registered(&vol);
         foreign.managed_by = "other-tool".to_string();
         foreign.write_to(mount_dir.path()).unwrap();
-        let err =
-            verify_destroy_safety("caisson", &reg, &apfs, Some(mount_dir.path())).unwrap_err();
+        let err = verify_destroy_safety("caisson", &reg, &apfs, Some(mount_dir.path()), false)
+            .unwrap_err();
         assert!(matches!(err, CaissonError::DestroySafetyViolation { .. }));
         assert!(err.to_string().contains("managed_by"));
     }
@@ -854,7 +935,8 @@ mod tests {
                 .write_to(mount_dir.path())
                 .unwrap();
 
-            let err = verify_destroy_safety(name, &reg, &apfs, Some(mount_dir.path())).unwrap_err();
+            let err = verify_destroy_safety(name, &reg, &apfs, Some(mount_dir.path()), false)
+                .unwrap_err();
             assert!(matches!(err, CaissonError::DestroySafetyViolation { .. }));
             assert!(
                 err.to_string().contains(expected_role),
@@ -890,8 +972,9 @@ mod tests {
                 .write_to(mount_dir.path())
                 .unwrap();
 
-            let err = verify_destroy_safety("protected-vol", &reg, &apfs, Some(mount_dir.path()))
-                .unwrap_err();
+            let err =
+                verify_destroy_safety("protected-vol", &reg, &apfs, Some(mount_dir.path()), false)
+                    .unwrap_err();
             assert!(matches!(err, CaissonError::DestroySafetyViolation { .. }));
             assert!(err.to_string().contains(role));
         }

@@ -61,16 +61,10 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Format bytes for `diskutil apfs addVolume -quota <size>` (exact integer bytes with `b` suffix,
-/// or clean `g`/`m` suffix when exact).
+/// Format bytes for `diskutil apfs addVolume -quota <size>` using exact integer bytes (`B` suffix)
+/// so `diskutil(8)` never interprets binary GiB counts as power-of-ten decimal `G` suffixes.
 pub fn format_diskutil_size(bytes: u64) -> String {
-    if bytes > 0 && bytes.is_multiple_of(GIB) {
-        format!("{}g", bytes / GIB)
-    } else if bytes > 0 && bytes.is_multiple_of(MIB) {
-        format!("{}m", bytes / MIB)
-    } else {
-        format!("{bytes}b")
-    }
+    format!("{bytes}B")
 }
 
 /// Parse durations like `7d`, `24h`, `30m`, `90s`, `2w`.
@@ -137,9 +131,9 @@ mod tests {
 
     #[test]
     fn formats_diskutil_sizes() {
-        assert_eq!(format_diskutil_size(300 * GIB), "300g");
-        assert_eq!(format_diskutil_size(512 * MIB), "512m");
-        assert_eq!(format_diskutil_size(12345), "12345b");
+        assert_eq!(format_diskutil_size(300 * GIB), "322122547200B");
+        assert_eq!(format_diskutil_size(512 * MIB), "536870912B");
+        assert_eq!(format_diskutil_size(12345), "12345B");
     }
 
     #[test]
