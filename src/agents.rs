@@ -14,10 +14,20 @@ pub const CAISSON_SKILL_MD: &str = include_str!("../skills/caisson/SKILL.md");
 /// Crisp drop-in snippet for repo-level `AGENTS.md` or `CLAUDE.md` files.
 pub const AGENTS_MD_SNIPPET: &str = r#"## macOS Worktrees (Caisson)
 - When you would otherwise run `git worktree add` yourself on macOS (and the host does not manage worktrees for you), prefer `caisson wt add <branch> --json`, `caisson wt ls --json`, and `caisson wt rm <slug>`.
-- If the host manages worktrees (T3 Code `workspaceStrategy`, Claude Code worktree isolation, or an IDE), let the host create them.
+- If the host manages worktrees (T3 Code `workspaceStrategy`, Claude Code worktree isolation, or an IDE), let the host create them and run `caisson wt hydrate --json` before `pnpm`/`npm`/`uv` install when `node_modules` or `.venv` is missing.
 - Worktrees live under `/Volumes/caisson/worktrees/...`; in Claude Code, allow edits there with `--add-dir /Volumes/caisson` or `additionalDirectories`.
 - Never run privileged `sudo caisson ...` commands (`init`, `vol`, `daemon`) from an agent turn; fall back to `git worktree` if `caisson` is missing or unmounted.
 "#;
+
+/// Deterministic 64-bit FNV-1a hex digest for detecting skill updates vs user customizations.
+pub fn skill_content_hash(content: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in content.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
 
 #[derive(Debug, Clone, Copy)]
 struct AgentSpec {
@@ -110,6 +120,8 @@ pub struct AgentHarnessStatus {
     pub display_name: String,
     pub detected: bool,
     pub installed: bool,
+    pub up_to_date: bool,
+    pub customized: bool,
     pub dismissed: bool,
     pub detect_path: String,
     pub skill_path: String,
@@ -120,6 +132,15 @@ pub struct AgentActionReport {
     pub action: String,
     pub dry_run: bool,
     pub targets: Vec<AgentHarnessStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentSyncReport {
+    pub dry_run: bool,
+    pub version: String,
+    pub updated: Vec<AgentHarnessStatus>,
+    pub skipped_customized: Vec<AgentHarnessStatus>,
+    pub already_up_to_date: Vec<String>,
 }
 
 /// Resolve the developer's real home directory, even when invoked under `sudo` (`SUDO_USER`).
@@ -202,7 +223,44 @@ fn detect_agent(home: &Path, spec: &AgentSpec) -> bool {
     false
 }
 
-/// Inspect detection, skill installation, and dismissal state for all known coding agents.
+/// Determine `(up_to_date, customized)` for an existing on-disk `SKILL.md`.
+fn classify_installed_skill(
+    spec_id: &str,
+    skill_path: &Path,
+    config: &CaissonConfig,
+) -> (bool, bool) {
+    let Ok(disk_content) = fs::read_to_string(skill_path) else {
+        return (false, false);
+    };
+    let current_hash = skill_content_hash(CAISSON_SKILL_MD);
+    let disk_hash = skill_content_hash(&disk_content);
+    if disk_hash == current_hash {
+        return (true, false);
+    }
+
+    // If Caisson previously recorded the hash it wrote for this agent, only treat the file
+    // as customized when the user modified it away from that recorded hash.
+    if let Some(recorded_hash) = config.agents.skill_hashes.get(spec_id) {
+        return (false, disk_hash != *recorded_hash);
+    }
+
+    // Backwards-compatible migration for v0.1.0-v0.1.4 installs before `skill_hashes` existed:
+    // if the agent is listed in `config.agents.installed` and starts with Caisson's YAML header,
+    // treat it as an unmodified Caisson-managed skill eligible for seamless auto-update.
+    let was_managed = config
+        .agents
+        .installed
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(spec_id));
+    let has_caisson_header = disk_content.starts_with("---\nname: caisson\n");
+    if was_managed && has_caisson_header {
+        (false, false)
+    } else {
+        (false, true)
+    }
+}
+
+/// Inspect detection, skill installation, freshness, and dismissal state for all known coding agents.
 pub fn inspect_agents(home: &Path, config: &CaissonConfig) -> Vec<AgentHarnessStatus> {
     KNOWN_AGENTS
         .iter()
@@ -211,6 +269,11 @@ pub fn inspect_agents(home: &Path, config: &CaissonConfig) -> Vec<AgentHarnessSt
             let skill_path = home.join(spec.skill_rel);
             let detected = detect_agent(home, spec);
             let installed = skill_path.is_file();
+            let (up_to_date, customized) = if installed {
+                classify_installed_skill(spec.id, &skill_path, config)
+            } else {
+                (false, false)
+            };
             let dismissed = config
                 .agents
                 .dismissed
@@ -221,6 +284,8 @@ pub fn inspect_agents(home: &Path, config: &CaissonConfig) -> Vec<AgentHarnessSt
                 display_name: spec.display_name.to_string(),
                 detected,
                 installed,
+                up_to_date,
+                customized,
                 dismissed,
                 detect_path: detect_path.display().to_string(),
                 skill_path: skill_path.display().to_string(),
@@ -271,6 +336,7 @@ pub fn install_agent_skills(
         None
     };
 
+    let current_hash = skill_content_hash(CAISSON_SKILL_MD);
     let mut affected = Vec::new();
     for spec in specs {
         let skill_path = home.join(spec.skill_rel);
@@ -292,15 +358,27 @@ pub fn install_agent_skills(
             }
             config
                 .agents
+                .skill_hashes
+                .insert(spec.id.to_string(), current_hash.clone());
+            config
+                .agents
                 .dismissed
                 .retain(|x| !x.eq_ignore_ascii_case(spec.id));
         }
+
+        let (up_to_date, customized) = if dry_run && skill_path.is_file() {
+            classify_installed_skill(spec.id, &skill_path, config)
+        } else {
+            (!dry_run, false)
+        };
 
         affected.push(AgentHarnessStatus {
             id: spec.id.to_string(),
             display_name: spec.display_name.to_string(),
             detected: detect_agent(home, spec),
             installed: if dry_run { skill_path.is_file() } else { true },
+            up_to_date,
+            customized,
             dismissed: false,
             detect_path: home.join(spec.detect_rel).display().to_string(),
             skill_path: skill_path.display().to_string(),
@@ -372,6 +450,7 @@ pub fn uninstall_agent_skills(
                 .agents
                 .installed
                 .retain(|x| !x.eq_ignore_ascii_case(spec.id));
+            config.agents.skill_hashes.remove(spec.id);
         }
 
         affected.push(AgentHarnessStatus {
@@ -379,6 +458,8 @@ pub fn uninstall_agent_skills(
             display_name: spec.display_name.to_string(),
             detected: home.join(spec.detect_rel).exists(),
             installed: if dry_run { skill_path.is_file() } else { false },
+            up_to_date: false,
+            customized: false,
             dismissed: config
                 .agents
                 .dismissed
@@ -419,14 +500,23 @@ pub fn dismiss_agents(
         {
             config.agents.dismissed.push(spec.id.to_string());
         }
+        let skill_path = home.join(spec.skill_rel);
+        let installed = skill_path.is_file();
+        let (up_to_date, customized) = if installed {
+            classify_installed_skill(spec.id, &skill_path, config)
+        } else {
+            (false, false)
+        };
         affected.push(AgentHarnessStatus {
             id: spec.id.to_string(),
             display_name: spec.display_name.to_string(),
             detected: home.join(spec.detect_rel).exists(),
-            installed: home.join(spec.skill_rel).is_file(),
+            installed,
+            up_to_date,
+            customized,
             dismissed: true,
             detect_path: home.join(spec.detect_rel).display().to_string(),
-            skill_path: home.join(spec.skill_rel).display().to_string(),
+            skill_path: skill_path.display().to_string(),
         });
     }
     Ok(AgentActionReport {
@@ -568,6 +658,147 @@ pub fn prompt_interactive_agent_setup(
     Ok(report)
 }
 
+/// Refresh all already-installed Caisson agent skills from this binary's embedded `SKILL.md`.
+///
+/// Never installs skills for agents the user did not opt into, refuses to overwrite symlinks,
+/// and preserves hand-edited user skills unless `force` is true.
+pub fn sync_installed_agent_skills(
+    home: &Path,
+    config: &mut CaissonConfig,
+    force: bool,
+    dry_run: bool,
+) -> Result<AgentSyncReport> {
+    let current_hash = skill_content_hash(CAISSON_SKILL_MD);
+    let owner = if crate::apfs::statfs::is_root() {
+        invoking_user()
+    } else {
+        None
+    };
+
+    let mut updated = Vec::new();
+    let mut skipped_customized = Vec::new();
+    let mut already_up_to_date = Vec::new();
+
+    for spec in KNOWN_AGENTS {
+        let skill_path = home.join(spec.skill_rel);
+        let Ok(meta) = fs::symlink_metadata(&skill_path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            continue;
+        }
+
+        let (up_to_date, customized) = classify_installed_skill(spec.id, &skill_path, config);
+        if up_to_date {
+            if !dry_run {
+                config
+                    .agents
+                    .skill_hashes
+                    .entry(spec.id.to_string())
+                    .or_insert_with(|| current_hash.clone());
+            }
+            already_up_to_date.push(spec.id.to_string());
+            continue;
+        }
+
+        let status_entry = AgentHarnessStatus {
+            id: spec.id.to_string(),
+            display_name: spec.display_name.to_string(),
+            detected: detect_agent(home, spec),
+            installed: true,
+            up_to_date: !dry_run && (!customized || force),
+            customized: customized && !force,
+            dismissed: config
+                .agents
+                .dismissed
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(spec.id)),
+            detect_path: home.join(spec.detect_rel).display().to_string(),
+            skill_path: skill_path.display().to_string(),
+        };
+
+        if customized && !force {
+            skipped_customized.push(status_entry);
+            continue;
+        }
+
+        if !dry_run {
+            fs::write(&skill_path, CAISSON_SKILL_MD)?;
+            if let Some(ref user) = owner {
+                chown_skill_tree(home, spec, user);
+            }
+            if !config
+                .agents
+                .installed
+                .iter()
+                .any(|x| x.eq_ignore_ascii_case(spec.id))
+            {
+                config.agents.installed.push(spec.id.to_string());
+            }
+            config
+                .agents
+                .skill_hashes
+                .insert(spec.id.to_string(), current_hash.clone());
+        }
+        updated.push(status_entry);
+    }
+
+    Ok(AgentSyncReport {
+        dry_run,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        updated,
+        skipped_customized,
+        already_up_to_date,
+    })
+}
+
+/// Automatically refresh already-installed Caisson agent skills after a binary upgrade
+/// (e.g. `brew upgrade beckhq/tap/caisson`).
+///
+/// Runs only when non-root, touches only unmodified already-installed Caisson skill files,
+/// and never writes to stdout so `--json` pipelines stay clean.
+pub fn auto_sync_installed_skills(config_path: &Path, json: bool) {
+    if crate::apfs::statfs::is_root() {
+        return;
+    }
+    let Ok(mut cfg) = CaissonConfig::load_from(config_path) else {
+        return;
+    };
+    let home = resolve_user_home();
+    let prev_hashes = cfg.agents.skill_hashes.clone();
+    let Ok(report) = sync_installed_agent_skills(&home, &mut cfg, false, false) else {
+        return;
+    };
+
+    if !report.updated.is_empty() || cfg.agents.skill_hashes != prev_hashes {
+        let _ = cfg.save_to(config_path);
+    }
+
+    if json {
+        return;
+    }
+    if !report.updated.is_empty() {
+        let ids: Vec<&str> = report.updated.iter().map(|t| t.id.as_str()).collect();
+        eprintln!(
+            "note: auto-updated caisson skill for {} (v{})",
+            ids.join(", "),
+            report.version
+        );
+    }
+    let interactive = unsafe { libc::isatty(libc::STDERR_FILENO) != 0 };
+    if interactive && !report.skipped_customized.is_empty() {
+        let ids: Vec<&str> = report
+            .skipped_customized
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        eprintln!(
+            "tip: customized caisson skill for {} has an update (run `caisson agent update --force` to overwrite).",
+            ids.join(", ")
+        );
+    }
+}
+
 /// Passive, `<0.2 ms` new-agent discovery hint printed to stderr ONLY on human-interactive TTY
 /// runs (never in `--json` mode, never when stdout/stderr is piped).
 pub fn maybe_notify_new_agents(config: &CaissonConfig, json: bool) {
@@ -681,5 +912,64 @@ mod tests {
             vec!["claude", "codex"]
         );
         assert!(parse_opt_out_selection("-unknown", &detected).is_err());
+    }
+
+    #[test]
+    fn sync_auto_updates_unmodified_skills_and_preserves_custom_edits() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+
+        let mut cfg = CaissonConfig::default();
+        install_agent_skills(
+            home,
+            &mut cfg,
+            &["claude".to_string(), "codex".to_string()],
+            false,
+            false,
+        )
+        .unwrap();
+
+        // Simulate a previous release's unmodified skill on claude (recorded hash matches disk)
+        // and a user-customized skill on codex (disk differs from recorded hash).
+        let old_skill = "---\nname: caisson\n---\n# old version\n";
+        fs::write(home.join(".claude/skills/caisson/SKILL.md"), old_skill).unwrap();
+        cfg.agents
+            .skill_hashes
+            .insert("claude".to_string(), skill_content_hash(old_skill));
+
+        let custom_skill = "---\nname: caisson\n---\n# user custom rules\n";
+        fs::write(home.join(".codex/skills/caisson/SKILL.md"), custom_skill).unwrap();
+
+        let inspected = inspect_agents(home, &cfg);
+        let claude = inspected.iter().find(|a| a.id == "claude").unwrap();
+        let codex = inspected.iter().find(|a| a.id == "codex").unwrap();
+        assert!(!claude.up_to_date && !claude.customized);
+        assert!(!codex.up_to_date && codex.customized);
+
+        // Auto-sync updates claude seamlessly and leaves codex untouched.
+        let sync = sync_installed_agent_skills(home, &mut cfg, false, false).unwrap();
+        assert_eq!(sync.updated.len(), 1);
+        assert_eq!(sync.updated[0].id, "claude");
+        assert_eq!(sync.skipped_customized.len(), 1);
+        assert_eq!(sync.skipped_customized[0].id, "codex");
+        assert_eq!(
+            fs::read_to_string(home.join(".claude/skills/caisson/SKILL.md")).unwrap(),
+            CAISSON_SKILL_MD
+        );
+        assert_eq!(
+            fs::read_to_string(home.join(".codex/skills/caisson/SKILL.md")).unwrap(),
+            custom_skill
+        );
+
+        // Explicit `--force` overwrites customized skill too.
+        let forced = sync_installed_agent_skills(home, &mut cfg, true, false).unwrap();
+        assert_eq!(forced.updated.len(), 1);
+        assert_eq!(forced.updated[0].id, "codex");
+        assert_eq!(
+            fs::read_to_string(home.join(".codex/skills/caisson/SKILL.md")).unwrap(),
+            CAISSON_SKILL_MD
+        );
     }
 }

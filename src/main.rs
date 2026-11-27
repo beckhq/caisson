@@ -1,6 +1,7 @@
 use caisson::agents::{
-    dismiss_agents, inspect_agents, install_agent_skills, maybe_notify_new_agents,
-    prompt_interactive_agent_setup, resolve_user_home, uninstall_agent_skills, AGENTS_MD_SNIPPET,
+    auto_sync_installed_skills, dismiss_agents, inspect_agents, install_agent_skills,
+    maybe_notify_new_agents, prompt_interactive_agent_setup, resolve_user_home,
+    sync_installed_agent_skills, uninstall_agent_skills, AGENTS_MD_SNIPPET,
 };
 use caisson::apfs::clonefile::clone_path;
 use caisson::apfs::volume::{
@@ -322,6 +323,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         },
 
         Commands::Status => {
+            auto_sync_installed_skills(&config_path, json);
             let config = CaissonConfig::load_from(&config_path)?;
             let status = build_status_report(&registry_path, &config)?;
             if json {
@@ -522,6 +524,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         },
 
         Commands::Doctor => {
+            auto_sync_installed_skills(&config_path, json);
             let cfg = CaissonConfig::load_from(&config_path)?;
             let report = run_doctor(&registry_path, &cfg)?;
             if json {
@@ -583,6 +586,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
 
         Commands::Wt { action } => {
+            auto_sync_installed_skills(&config_path, json);
             let cfg = CaissonConfig::load_from(&config_path)?;
             match action {
                 WtCommands::Add {
@@ -863,13 +867,22 @@ fn dispatch(cli: Cli) -> Result<()> {
                         print_json(&statuses)?;
                     } else {
                         println!(
-                            "{:<14} {:<10} {:<10} {:<10} SKILL PATH",
-                            "AGENT", "DETECTED", "INSTALLED", "DISMISSED"
+                            "{:<14} {:<10} {:<14} {:<10} SKILL PATH",
+                            "AGENT", "DETECTED", "STATE", "DISMISSED"
                         );
                         for s in &statuses {
+                            let state = if !s.installed {
+                                "not-installed"
+                            } else if s.up_to_date {
+                                "up-to-date"
+                            } else if s.customized {
+                                "customized"
+                            } else {
+                                "outdated"
+                            };
                             println!(
-                                "{:<14} {:<10} {:<10} {:<10} {}",
-                                s.id, s.detected, s.installed, s.dismissed, s.skill_path
+                                "{:<14} {:<10} {:<14} {:<10} {}",
+                                s.id, s.detected, state, s.dismissed, s.skill_path
                             );
                         }
                     }
@@ -941,6 +954,52 @@ fn dispatch(cli: Cli) -> Result<()> {
                         );
                         for t in &report.targets {
                             println!("  - {} ({})", t.id, t.skill_path);
+                        }
+                    }
+                }
+
+                AgentCommands::Update { force, dry_run } => {
+                    let report = sync_installed_agent_skills(&home, &mut cfg, force, dry_run)?;
+                    if !dry_run {
+                        cfg.save_to(&config_path)?;
+                    }
+                    if json {
+                        print_json(&report)?;
+                    } else {
+                        let prefix = if report.dry_run { "[dry-run] " } else { "" };
+                        if report.updated.is_empty() && report.skipped_customized.is_empty() {
+                            if report.already_up_to_date.is_empty() {
+                                println!(
+                                    "{prefix}No Caisson agent skills installed (run `caisson agent install`)."
+                                );
+                            } else {
+                                println!(
+                                    "{prefix}All installed agent skills are up to date ({}).",
+                                    report.already_up_to_date.join(", ")
+                                );
+                            }
+                        } else {
+                            if !report.updated.is_empty() {
+                                println!(
+                                    "{prefix}{} Caisson skill for {} agent(s) (v{}):",
+                                    if report.dry_run {
+                                        "Would update"
+                                    } else {
+                                        "Updated"
+                                    },
+                                    report.updated.len(),
+                                    report.version
+                                );
+                                for t in &report.updated {
+                                    println!("  - {} -> {}", t.id, t.skill_path);
+                                }
+                            }
+                            for s in &report.skipped_customized {
+                                println!(
+                                    "{prefix}Skipped customized skill for {} ({}); pass `--force` to overwrite.",
+                                    s.id, s.skill_path
+                                );
+                            }
                         }
                     }
                 }

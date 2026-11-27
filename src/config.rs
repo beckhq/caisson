@@ -1,6 +1,7 @@
 use crate::error::{CaissonError, Result};
 use crate::units::{parse_duration, parse_size};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -24,6 +25,8 @@ pub struct CaissonConfig {
 pub struct AgentsConfig {
     pub installed: Vec<String>,
     pub dismissed: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skill_hashes: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

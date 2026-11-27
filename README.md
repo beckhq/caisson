@@ -210,7 +210,7 @@ caisson config set quotas.soft_disk_limit 400G
 | `caisson watch --label <name> --out <jsonl> [--watch-pid <pid>]` | Passive build telemetry sampler (`JSONL` + `.summary.json`) |
 | `caisson status` / `caisson vol ls` | Inspect container capacity, volumes, shields, and daemon state |
 | `caisson config show \| get \| set` | View or live-edit soft quotas without `sudo` |
-| `caisson agent status \| install \| uninstall \| dismiss \| snippet` | Wire up coding agents (Claude Code, Codex, Antigravity, Cursor, OpenCode, Windsurf) |
+| `caisson agent status \| install \| update \| uninstall \| dismiss \| snippet` | Wire up & auto-sync coding agents (Claude Code, Codex, Antigravity, Cursor, OpenCode, Windsurf) |
 | `caisson completions <zsh\|bash\|fish>` | Generate shell completions |
 | `caisson shell-init <zsh\|bash\|fish> [--alias cai]` | Enable `caisson wt cd <slug>` shell navigation |
 
@@ -244,7 +244,7 @@ caisson agent status
 caisson agent snippet
 ```
 
-During interactive `sudo caisson init`, Caisson detects your installed coding agents and offers to install the skill right away (pass `--no-agents` to skip). If you install a new coding agent later, interactive `caisson status` / `caisson doctor` / `caisson wt add` runs print a one-line tip on stderr offering `caisson agent install <agent>` (or `caisson agent dismiss <agent>` to silence).
+During interactive `sudo caisson init`, Caisson detects your installed coding agents and offers to install the skill right away (pass `--no-agents` to skip). After future `brew upgrade` updates, unmodified installed skills automatically refresh to the new binary's embedded `SKILL.md` on your next `caisson` run (hand-edited skills are never overwritten unless you pass `caisson agent update --force`). If you install a new coding agent later, interactive `caisson status` / `caisson doctor` / `caisson wt add` runs print a one-line tip on stderr offering `caisson agent install <agent>` (or `caisson agent dismiss <agent>` to silence).
 
 ### T3 Code & External Worktree Managers
 

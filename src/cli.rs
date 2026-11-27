@@ -237,6 +237,17 @@ pub enum AgentCommands {
         dry_run: bool,
     },
 
+    /// Refresh already-installed agent skills to match this binary's embedded `SKILL.md` (preserves custom edits unless `--force`).
+    Update {
+        /// Overwrite customized skill files too.
+        #[arg(long)]
+        force: bool,
+
+        /// Preview planned updates without writing files.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Silence passive discovery tips for specified coding agents.
     Dismiss {
         /// Agent IDs to silence (e.g. `codex`, `cursor`).
