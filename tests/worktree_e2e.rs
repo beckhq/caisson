@@ -478,3 +478,59 @@ fn worktree_from_ref_custom_slug_warm_cache_and_multi_repo_ls_all() {
         2
     );
 }
+
+#[test]
+fn wt_path_completions_and_shell_init_work() {
+    let sandbox = tempdir().unwrap();
+    let repo_dir = sandbox.path().join("shell-repo");
+    let caisson_root = sandbox.path().join("mock-caisson-vol");
+    let config_path = sandbox.path().join("config.toml");
+    fs::create_dir_all(&caisson_root).unwrap();
+
+    init_sample_repo(&repo_dir);
+    assert!(run_caisson(
+        &repo_dir,
+        &caisson_root,
+        &config_path,
+        &["config", "set", "quotas.min_host_free", "0G"],
+    )
+    .status
+    .success());
+
+    let add = run_caisson(
+        &repo_dir,
+        &caisson_root,
+        &config_path,
+        &["wt", "add", "feat/shell-nav"],
+    );
+    assert!(add.status.success());
+    let expected_path = String::from_utf8_lossy(&add.stdout).trim().to_string();
+
+    let path_out = run_caisson(
+        &repo_dir,
+        &caisson_root,
+        &config_path,
+        &["wt", "path", "feat-shell-nav"],
+    );
+    assert!(path_out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&path_out.stdout).trim(),
+        expected_path
+    );
+
+    let comp = Command::new(caisson_bin())
+        .args(["completions", "zsh"])
+        .output()
+        .unwrap();
+    assert!(comp.status.success());
+    assert!(String::from_utf8_lossy(&comp.stdout).contains("#compdef caisson"));
+
+    let init = Command::new(caisson_bin())
+        .args(["shell-init", "zsh", "--alias", "cai"])
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    let init_str = String::from_utf8_lossy(&init.stdout);
+    assert!(init_str.contains("caisson wt path"));
+    assert!(init_str.contains("alias cai=caisson"));
+}

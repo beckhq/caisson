@@ -1,5 +1,12 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ShellKind {
+    Zsh,
+    Bash,
+    Fish,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -131,6 +138,24 @@ pub enum Commands {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+
+    /// Generate shell completion scripts (`zsh`, `bash`, `fish`).
+    Completions {
+        /// Target shell.
+        #[arg(value_enum)]
+        shell: ShellKind,
+    },
+
+    /// Print shell integration snippet enabling `caisson wt cd <target>` (and optional alias).
+    ShellInit {
+        /// Target shell (`zsh`, `bash`, or `fish`).
+        #[arg(value_enum)]
+        shell: ShellKind,
+
+        /// Optional short alias name (e.g. `--alias cai`).
+        #[arg(long)]
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -170,6 +195,16 @@ pub enum WtCommands {
         /// Show worktrees across all repositories.
         #[arg(long)]
         all: bool,
+    },
+
+    /// Print the canonical filesystem path of a managed worktree (for `cd` / scripts).
+    Path {
+        /// Worktree slug, branch name, or full path.
+        target: String,
+
+        /// Target git repository path (defaults to current working directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
     },
 
     /// Remove a worktree via instant `<1ms` atomic rename to `.trash/` and async unlink.

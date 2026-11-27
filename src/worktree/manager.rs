@@ -458,6 +458,28 @@ pub fn wt_ls(
     scan_managed_worktrees(&caisson_root, repo_filter.as_deref(), SystemTime::now())
 }
 
+/// Resolve a managed worktree entry by slug, branch name, or path.
+pub fn wt_path(
+    config: &CaissonConfig,
+    target: &str,
+    repo_path: Option<&Path>,
+) -> Result<WorktreeEntry> {
+    let caisson_root = config.resolve_root();
+    if !caisson_root.exists() {
+        return Err(CaissonError::Message(format!(
+            "Caisson root '{}' does not exist",
+            caisson_root.display()
+        )));
+    }
+    let cwd = match repo_path {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+    let current_repo = discover_repo(&cwd).ok();
+    let all_wts = scan_managed_worktrees(&caisson_root, None, SystemTime::now())?;
+    resolve_worktree_target(target, &all_wts, current_repo.as_ref())
+}
+
 /// Remove a worktree via instant `<1 ms` atomic rename to `.trash/<uuid>` + `git worktree prune`.
 pub fn wt_rm(
     config: &CaissonConfig,
@@ -476,7 +498,7 @@ pub fn wt_rm(
     let current_repo = discover_repo(&cwd).ok();
     let all_wts = scan_managed_worktrees(&caisson_root, None, SystemTime::now())?;
 
-    let matched = resolve_rm_target(target, &all_wts, current_repo.as_ref())?;
+    let matched = resolve_worktree_target(target, &all_wts, current_repo.as_ref())?;
 
     // Verify safety boundary: target MUST reside under `<caisson_root>/worktrees/`.
     let canonical_wt = fs::canonicalize(&matched.path)?;
@@ -520,7 +542,7 @@ pub fn wt_rm(
     })
 }
 
-fn resolve_rm_target(
+fn resolve_worktree_target(
     target: &str,
     all_wts: &[WorktreeEntry],
     current_repo: Option<&GitRepoContext>,

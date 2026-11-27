@@ -3,7 +3,9 @@ use caisson::apfs::volume::{
     build_status_report, create_volume, destroy_volume, list_registered_volumes, shield_volume,
     CreateVolumeOptions, QuotaSpec,
 };
-use caisson::cli::{Cli, Commands, ConfigCommands, DaemonCommands, VolCommands, WtCommands};
+use caisson::cli::{
+    Cli, Commands, ConfigCommands, DaemonCommands, ShellKind, VolCommands, WtCommands,
+};
 use caisson::config::CaissonConfig;
 use caisson::daemon::launchd::{
     daemon_status, install_daemon, mount_all, uninstall_daemon, LAUNCH_DAEMON_PLIST_PATH,
@@ -14,10 +16,12 @@ use caisson::registry::{VolumeRegistry, VolumeTier};
 use caisson::units::format_bytes;
 use caisson::watch::{run_watch, WatchOptions};
 use caisson::worktree::manager::{
-    run_gc, wt_add, wt_ls, wt_prune, wt_rm, WtAddOptions, WtPruneOptions,
+    run_gc, wt_add, wt_ls, wt_path, wt_prune, wt_rm, WtAddOptions, WtPruneOptions,
 };
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::{generate, Shell};
 use serde::Serialize;
+use std::io;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -590,6 +594,15 @@ fn dispatch(cli: Cli) -> Result<()> {
                     }
                 }
 
+                WtCommands::Path { target, repo } => {
+                    let entry = wt_path(&cfg, &target, repo.as_deref())?;
+                    if json {
+                        print_json(&entry)?;
+                    } else {
+                        println!("{}", entry.path);
+                    }
+                }
+
                 WtCommands::Rm {
                     target,
                     repo,
@@ -690,7 +703,71 @@ fn dispatch(cli: Cli) -> Result<()> {
                 );
             }
         }
+
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let clap_shell = match shell {
+                ShellKind::Zsh => Shell::Zsh,
+                ShellKind::Bash => Shell::Bash,
+                ShellKind::Fish => Shell::Fish,
+            };
+            generate(clap_shell, &mut cmd, "caisson", &mut io::stdout());
+        }
+
+        Commands::ShellInit { shell, alias } => {
+            print!("{}", render_shell_init(shell, alias.as_deref()));
+        }
     }
 
     Ok(())
+}
+
+fn render_shell_init(shell: ShellKind, alias: Option<&str>) -> String {
+    let mut script = match shell {
+        ShellKind::Zsh | ShellKind::Bash => String::from(
+            r#"# Caisson shell integration — enables `caisson wt cd <target>`
+caisson() {
+  if [ "$1" = "wt" ] && [ "$2" = "cd" ] && [ -n "$3" ]; then
+    local target_dir
+    target_dir="$(command caisson wt path "$3")" || return $?
+    builtin cd "$target_dir" || return $?
+    return 0
+  fi
+  command caisson "$@"
+}
+"#,
+        ),
+        ShellKind::Fish => String::from(
+            r#"# Caisson shell integration — enables `caisson wt cd <target>`
+function caisson --wraps caisson
+    if test (count $argv) -ge 3; and test "$argv[1]" = "wt"; and test "$argv[2]" = "cd"
+        set -l target_dir (command caisson wt path "$argv[3]")
+        or return $status
+        builtin cd "$target_dir"
+        return $status
+    end
+    command caisson $argv
+end
+"#,
+        ),
+    };
+
+    if let Some(short) = alias {
+        let trimmed = short.trim();
+        if !trimmed.is_empty()
+            && trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            match shell {
+                ShellKind::Zsh | ShellKind::Bash => {
+                    script.push_str(&format!("alias {trimmed}=caisson\n"));
+                }
+                ShellKind::Fish => {
+                    script.push_str(&format!("alias {trimmed} caisson\n"));
+                }
+            }
+        }
+    }
+    script
 }
