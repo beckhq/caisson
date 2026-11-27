@@ -13,9 +13,10 @@ pub const CAISSON_SKILL_MD: &str = include_str!("../skills/caisson/SKILL.md");
 
 /// Crisp drop-in snippet for repo-level `AGENTS.md` or `CLAUDE.md` files.
 pub const AGENTS_MD_SNIPPET: &str = r#"## macOS Worktrees (Caisson)
-- When creating or cleaning up git worktrees on macOS, prefer `caisson wt add <branch> --json`, `caisson wt ls --json`, and `caisson wt rm <slug>` over raw `git worktree` so worktrees run on the daemon-shielded `/Volumes/caisson` APFS volume with instant CoW dependency cloning.
-- Never run privileged `sudo caisson ...` commands (`init`, `vol`, `daemon`) from an agent turn.
-- If `caisson wt add` returns a `quota_violation`, surface `suggested_command` to the user rather than forcing past quotas.
+- When you would otherwise run `git worktree add` yourself on macOS (and the host does not manage worktrees for you), prefer `caisson wt add <branch> --json`, `caisson wt ls --json`, and `caisson wt rm <slug>`.
+- If the host manages worktrees (T3 Code `workspaceStrategy`, Claude Code worktree isolation, or an IDE), let the host create them.
+- Worktrees live under `/Volumes/caisson/worktrees/...`; in Claude Code, allow edits there with `--add-dir /Volumes/caisson` or `additionalDirectories`.
+- Never run privileged `sudo caisson ...` commands (`init`, `vol`, `daemon`) from an agent turn; fall back to `git worktree` if `caisson` is missing or unmounted.
 "#;
 
 #[derive(Debug, Clone, Copy)]

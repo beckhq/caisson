@@ -1,28 +1,39 @@
 ---
 name: caisson
-description: Use Caisson on macOS to create, inspect, and clean up daemon-shielded sibling APFS git worktrees with instant Copy-on-Write dependency cloning instead of raw `git worktree` on `/`.
+description: Use Caisson on macOS when you would otherwise run `git worktree add` yourself, to create, list, or remove worktrees on the daemon-shielded `/Volumes/caisson` APFS volume. Let the host manage worktrees when it owns them (T3 Code `workspaceStrategy`, Claude Code worktree isolation, or IDE worktree managers).
 ---
 
-# Caisson (macOS APFS Worktree Engine)
+# Caisson (macOS APFS Worktrees)
 
-Use `caisson` whenever you create, list, or remove git worktrees or perform Copy-on-Write clones on macOS. Caisson places worktrees on the shielded `/Volumes/caisson` sibling APFS volume (isolated from Spotlight, `fseventsd` disk logs, Time Machine snapshots, and `atime` churn) with zero `sudo` required.
+## When to Use
 
-## Quick Check
+- Use `caisson wt` when **you** would otherwise invoke `git worktree add` / `list` / `remove` directly on macOS.
+- **Do not route around host-managed worktrees.** If your host environment creates or binds a worktree for the thread (such as T3 Code `workspaceStrategy`, Claude Code worktree isolation, or an IDE worktree manager), let the host manage it.
 
-Before creating a worktree, verify that `/Volumes/caisson` is initialized:
+## Preflight & Failure Cases
+
+Check availability before creating a worktree:
 
 ```bash
-caisson status --json
+command -v caisson && caisson status --json
 ```
 
-If `tier1_root_exists` is `true`, use `caisson wt` for all worktree operations. If it is `false`, do **not** run `sudo caisson init` yourself; tell the user to run `sudo caisson init` once, or fall back to standard `git worktree`.
+Handle each state explicitly:
+- **`caisson` not installed:** Fall back to standard `git worktree`.
+- **Not initialized (`tier1_root_exists: false` and no `caisson` volume registered):** Do not run `sudo caisson init` yourself. Fall back to standard `git worktree` and tell the user they can run `sudo caisson init` once.
+- **Registered but unmounted (`mounted: false`, e.g. after a reboot without the LaunchDaemon):** Tell the user to mount it (`sudo caisson mount-all` or `diskutil mount caisson`), or fall back to standard `git worktree` if immediate progress is required.
+- **Ready (`tier1_root_exists: true`):** Use `caisson wt` below.
 
-## Standard Agent Commands (All Zero-`sudo`)
+## Outside-the-Project Working Directory Gotcha
 
-Always pass `--json` when parsing command output programmatically.
+Worktrees created by `caisson wt add` live under `/Volumes/caisson/worktrees/...`, which is outside the original repository directory. Agents with directory-scoped write approvals (such as Claude Code) will prompt on every file edit unless `/Volumes/caisson` (or the worktree path) is permitted via `--add-dir /Volumes/caisson` or `additionalDirectories` in settings.
+
+## Standard Commands (All Zero-`sudo`)
+
+Always pass `--json` when parsing output programmatically.
 
 ```bash
-# Create a worktree on /Volumes/caisson (auto-clones .caisson.toml cow_copy deps via APFS clonefile)
+# Create a worktree on /Volumes/caisson
 caisson wt add <branch> [--from <ref>] [--name <slug>] --json
 
 # List managed worktrees (current repo, or --all across repos)
@@ -32,7 +43,7 @@ caisson wt ls --all --json
 # Print canonical filesystem path of a worktree
 caisson wt path <slug-or-branch>
 
-# Remove a clean worktree in <1 ms (atomic rename to .trash/ + git worktree prune + async unlink)
+# Remove a clean worktree (atomic rename to .trash/ + git worktree prune + background unlink)
 caisson wt rm <slug-or-branch> --json
 # Only pass --force if the user explicitly asked to discard uncommitted or unpushed work:
 caisson wt rm <slug-or-branch> --force --json
@@ -40,22 +51,32 @@ caisson wt rm <slug-or-branch> --force --json
 # Preview inactive worktrees eligible for cleanup (dry-run by default)
 caisson wt prune --inactive 7d --json
 
-# Native O(1) APFS Copy-on-Write clone on the same volume
-caisson clone <src> <dst> --json
-
 # Read-only macOS daemon & storage health audit
 caisson doctor --json
 ```
 
-## Handling Soft Quotas
+## Optional `.caisson.toml` & Large Repos
 
-If `caisson wt add --json` exits non-zero with a `quota_violation` JSON object:
-1. Inspect `quota_violation.rule`, `quota_violation.reclaimable_worktrees`, and `quota_violation.suggested_command`.
-2. Preview reclaimable worktrees with `caisson wt prune --json` (dry-run).
-3. Ask the user before running `caisson wt prune --apply` or passing `--force`.
+`caisson wt add` checks out **tracked git files only** plus any relative paths listed under `cow_copy` in `<repo>/.caisson.toml`:
 
-## Rules
+```toml
+[worktree]
+cow_copy = ["node_modules", ".venv", ".turbo"]
+```
 
-- **Never run `sudo` commands** (`caisson init`, `caisson vol create/shield/destroy`, `caisson daemon install/uninstall`) from an agent turn; those are human-only administrative actions.
-- **Never delete dirty or unpushed worktrees** with `--force` unless the user explicitly requested it.
-- Prefer `caisson wt add <branch> --json` and use the returned `path` field as your working directory.
+- Safe on large (e.g. Chromium-scale) repos: untracked build output directories (`out/`, `target/`, `DerivedData/`) are not copied unless listed in `cow_copy`.
+- **Never put build output directories in `cow_copy`**; restrict `cow_copy` to dependency/package caches.
+
+## Same-Volume Limit for `caisson clone`
+
+```bash
+caisson clone <src> <dst> --json
+```
+
+`caisson clone` invokes Darwin `clonefile(2)` directly. **It fails with `EXDEV` if `<src>` and `<dst>` are on different volumes** (for example, `/` to `/Volumes/caisson`) and does **not** fall back to a byte copy. Both paths must reside on the same APFS volume.
+
+## Soft Quotas & Rules
+
+- If `caisson wt add --json` exits non-zero with a `quota_violation` object, inspect `quota_violation.rule`, `quota_violation.reclaimable_worktrees`, and `quota_violation.suggested_command`. Preview with `caisson wt prune --json` and ask the user before running `--apply` or `--force`.
+- **Never run `sudo` commands** (`caisson init`, `caisson vol ...`, `caisson daemon ...`) from an agent turn.
+- **Never pass `--force` to `caisson wt rm`** unless the user explicitly requested discarding uncommitted or unpushed changes.
