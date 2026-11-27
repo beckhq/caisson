@@ -1,5 +1,5 @@
 use crate::error::{CaissonError, Result};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 
 /// Whether ANSI styling should be emitted (respects `NO_COLOR`, `TERM=dumb`, and TTY).
@@ -146,6 +146,7 @@ enum Key {
     Escape,
     CtrlC,
     Char(char),
+    Unknown,
 }
 
 struct RawModeGuard {
@@ -192,9 +193,9 @@ impl Drop for RawModeGuard {
     }
 }
 
-fn stdin_has_byte_within(timeout_ms: i32) -> bool {
+fn fd_has_byte_within(fd: i32, timeout_ms: i32) -> bool {
     let mut pfd = libc::pollfd {
-        fd: io::stdin().as_raw_fd(),
+        fd,
         events: libc::POLLIN,
         revents: 0,
     };
@@ -202,39 +203,67 @@ fn stdin_has_byte_within(timeout_ms: i32) -> bool {
     rc > 0 && (pfd.revents & libc::POLLIN) != 0
 }
 
-fn read_key() -> Result<Key> {
-    let mut stdin = io::stdin();
-    let mut buf = [0u8; 1];
-    let n = stdin.read(&mut buf)?;
-    if n == 0 {
-        return Ok(Key::CtrlC);
+/// Unbuffered single-byte read directly from `fd` (retries on `EINTR`) so `poll(2)` and `read(2)`
+/// always observe the exact same kernel buffer (unlike `std::io::Stdin`, which buffers 8 KiB).
+fn read_raw_byte(fd: i32) -> Result<Option<u8>> {
+    let mut b = 0u8;
+    loop {
+        let rc = unsafe { libc::read(fd, (&mut b as *mut u8).cast::<libc::c_void>(), 1) };
+        if rc == 1 {
+            return Ok(Some(b));
+        }
+        if rc == 0 {
+            return Ok(None);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(CaissonError::Io(err));
     }
-    match buf[0] {
+}
+
+fn read_key_from_fd(fd: i32) -> Result<Key> {
+    let Some(first) = read_raw_byte(fd)? else {
+        return Ok(Key::CtrlC);
+    };
+    match first {
         3 => Ok(Key::CtrlC),
         b'\r' | b'\n' => Ok(Key::Enter),
         b' ' => Ok(Key::Space),
         0x1b => {
             // Bounded poll so a lone Escape key returns immediately instead of blocking forever.
-            let mut seq = [0u8; 2];
-            if stdin_has_byte_within(25)
-                && stdin.read(&mut seq[0..1]).unwrap_or(0) == 1
-                && seq[0] == b'['
-                && stdin_has_byte_within(25)
-                && stdin.read(&mut seq[1..2]).unwrap_or(0) == 1
-            {
-                return match seq[1] {
+            if !fd_has_byte_within(fd, 25) {
+                return Ok(Key::Escape);
+            }
+            let Some(second) = read_raw_byte(fd)? else {
+                return Ok(Key::Escape);
+            };
+            if second == b'[' || second == b'O' {
+                if !fd_has_byte_within(fd, 25) {
+                    return Ok(Key::Unknown);
+                }
+                let Some(third) = read_raw_byte(fd)? else {
+                    return Ok(Key::Unknown);
+                };
+                return match third {
                     b'A' => Ok(Key::Up),
                     b'B' => Ok(Key::Down),
-                    _ => Ok(Key::Escape),
+                    // Ignore Left/Right/Home/End/PageUp/etc. rather than cancelling setup.
+                    _ => Ok(Key::Unknown),
                 };
             }
-            Ok(Key::Escape)
+            Ok(Key::Unknown)
         }
         b'k' => Ok(Key::Up),
         b'j' => Ok(Key::Down),
         c if c.is_ascii() => Ok(Key::Char(c as char)),
-        _ => Ok(Key::Char('?')),
+        _ => Ok(Key::Unknown),
     }
+}
+
+fn read_key() -> Result<Key> {
+    read_key_from_fd(io::stdin().as_raw_fd())
 }
 
 fn clear_rendered_lines(count: usize) {
@@ -495,5 +524,31 @@ mod tests {
         assert_eq!(lines[0].chars().count(), lines[2].chars().count());
         assert!(lines[1].contains("[CAISSON]"));
         assert!(lines[1].contains("APFS Workspace Setup"));
+    }
+
+    #[test]
+    fn decodes_csi_and_ss3_arrows_without_buffering_conflict_and_handles_lone_escape() {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rfd, wfd) = (fds[0], fds[1]);
+
+        let write_bytes = |bytes: &[u8]| {
+            let n = unsafe { libc::write(wfd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len()) };
+            assert_eq!(n as usize, bytes.len());
+        };
+
+        write_bytes(b"\x1b[A\x1b[B\x1bOA\x1bOB\x1b[C\x1b");
+        assert_eq!(read_key_from_fd(rfd).unwrap(), Key::Up);
+        assert_eq!(read_key_from_fd(rfd).unwrap(), Key::Down);
+        assert_eq!(read_key_from_fd(rfd).unwrap(), Key::Up);
+        assert_eq!(read_key_from_fd(rfd).unwrap(), Key::Down);
+        assert_eq!(read_key_from_fd(rfd).unwrap(), Key::Unknown);
+        // Lone Escape must return Key::Escape via bounded poll (not block forever).
+        assert_eq!(read_key_from_fd(rfd).unwrap(), Key::Escape);
+
+        unsafe {
+            libc::close(rfd);
+            libc::close(wfd);
+        }
     }
 }
