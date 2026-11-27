@@ -7,3 +7,4 @@ pub mod error;
 pub mod registry;
 pub mod units;
 pub mod watch;
+pub mod worktree;

@@ -118,6 +118,108 @@ pub enum Commands {
         /// Destination path (must reside on the same APFS volume and not exist).
         dst: PathBuf,
     },
+
+    /// Manage Copy-on-Write git worktrees on the shared Tier-1 Caisson volume (zero sudo).
+    Wt {
+        #[command(subcommand)]
+        action: WtCommands,
+    },
+
+    /// Drain `.trash/` and reconcile orphaned git worktree metadata.
+    Gc {
+        /// Optional path to a git repository to reconcile in addition to managed worktrees.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WtCommands {
+    /// Create a new git worktree on `/Volumes/caisson` with optional APFS CoW cloning.
+    Add {
+        /// Branch name to create or check out.
+        branch: String,
+
+        /// Base ref (commit, tag, or branch) when creating a new branch.
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Explicit worktree directory slug (defaults to sanitized branch name).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Target git repository path (defaults to current working directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Skip `.caisson.toml` `cow_copy` cloning.
+        #[arg(long)]
+        no_cow: bool,
+
+        /// Bypass soft quota limits (emits a warning instead of refusing).
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// List managed Caisson worktrees with last-activity age, dirty/unpushed flags, and size.
+    Ls {
+        /// Target git repository path (defaults to current working directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Show worktrees across all repositories.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Remove a worktree via instant `<1ms` atomic rename to `.trash/` and async unlink.
+    Rm {
+        /// Worktree slug, branch name, or full path.
+        target: String,
+
+        /// Target git repository path (defaults to current working directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Remove even if the worktree has uncommitted changes or unpushed commits.
+        #[arg(long)]
+        force: bool,
+
+        /// Unlink files synchronously instead of spawning a detached background worker.
+        #[arg(long)]
+        sync: bool,
+    },
+
+    /// Prune inactive worktrees based on last-activity timestamp (dry-run by default).
+    Prune {
+        /// Inactivity threshold (e.g. `7d`, `48h`, `30m`). Defaults to `prune.default_inactive`.
+        #[arg(long)]
+        inactive: Option<String>,
+
+        /// Include worktrees with uncommitted changes.
+        #[arg(long)]
+        include_dirty: bool,
+
+        /// Include worktrees with unpushed commits.
+        #[arg(long)]
+        include_unpushed: bool,
+
+        /// Prune across all repositories instead of only the current repository.
+        #[arg(long)]
+        all: bool,
+
+        /// Target git repository path (defaults to current working directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Actually remove matching worktrees (without `--apply`, runs in dry-run preview mode).
+        #[arg(long)]
+        apply: bool,
+
+        /// Unlink removed worktrees synchronously when `--apply` is given.
+        #[arg(long)]
+        sync: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

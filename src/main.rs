@@ -3,7 +3,7 @@ use caisson::apfs::volume::{
     build_status_report, create_volume, destroy_volume, list_registered_volumes, shield_volume,
     CreateVolumeOptions, QuotaSpec,
 };
-use caisson::cli::{Cli, Commands, ConfigCommands, DaemonCommands, VolCommands};
+use caisson::cli::{Cli, Commands, ConfigCommands, DaemonCommands, VolCommands, WtCommands};
 use caisson::config::CaissonConfig;
 use caisson::daemon::launchd::{
     daemon_status, install_daemon, mount_all, uninstall_daemon, LAUNCH_DAEMON_PLIST_PATH,
@@ -13,6 +13,9 @@ use caisson::error::{CaissonError, Result};
 use caisson::registry::{VolumeRegistry, VolumeTier};
 use caisson::units::format_bytes;
 use caisson::watch::{run_watch, WatchOptions};
+use caisson::worktree::manager::{
+    run_gc, wt_add, wt_ls, wt_prune, wt_rm, WtAddOptions, WtPruneOptions,
+};
 use clap::Parser;
 use serde::Serialize;
 use std::path::Path;
@@ -500,6 +503,191 @@ fn dispatch(cli: Cli) -> Result<()> {
                 })?;
             } else {
                 println!("Cloned {} -> {} (APFS CoW)", src.display(), dst.display());
+            }
+        }
+
+        Commands::Wt { action } => {
+            let cfg = CaissonConfig::load_from(&config_path)?;
+            match action {
+                WtCommands::Add {
+                    branch,
+                    from,
+                    name,
+                    repo,
+                    no_cow,
+                    force,
+                } => {
+                    let report = wt_add(
+                        &cfg,
+                        &WtAddOptions {
+                            branch,
+                            from_ref: from,
+                            name,
+                            repo_path: repo,
+                            no_cow,
+                            force,
+                        },
+                    )?;
+                    if json {
+                        print_json(&report)?;
+                    } else {
+                        for w in &report.warnings {
+                            eprintln!("warning: {w}");
+                        }
+                        for c in &report.cow_clones {
+                            if c.status == "cloned" {
+                                eprintln!(
+                                    "cow-cloned '{}' from {}",
+                                    c.entry,
+                                    c.source.as_deref().unwrap_or("")
+                                );
+                            } else if let Some(ref detail) = c.detail {
+                                eprintln!("cow-copy '{}' ({}): {detail}", c.entry, c.status);
+                            }
+                        }
+                        // Print canonical worktree path on stdout for easy shell capture (`cd "$(caisson wt add ...)"`).
+                        println!("{}", report.path);
+                    }
+                }
+
+                WtCommands::Ls { repo, all } => {
+                    let entries = wt_ls(&cfg, repo.as_deref(), all)?;
+                    if json {
+                        print_json(&entries)?;
+                    } else if entries.is_empty() {
+                        println!("No managed Caisson worktrees found.");
+                    } else {
+                        println!(
+                            "{:<22} {:<20} {:<8} {:<10} {:<14} PATH",
+                            "SLUG", "BRANCH", "IDLE", "SIZE", "STATE"
+                        );
+                        for e in &entries {
+                            let mut flags = Vec::new();
+                            if e.dirty {
+                                flags.push("dirty");
+                            }
+                            if e.unpushed {
+                                flags.push("unpushed");
+                            }
+                            if e.orphaned {
+                                flags.push("orphaned");
+                            }
+                            let state = if flags.is_empty() {
+                                "clean".to_string()
+                            } else {
+                                flags.join(",")
+                            };
+                            println!(
+                                "{:<22} {:<20} {:<8} {:<10} {:<14} {}",
+                                e.slug,
+                                e.branch.as_deref().unwrap_or("-"),
+                                e.inactive_human,
+                                format_bytes(e.disk_bytes),
+                                state,
+                                e.path
+                            );
+                        }
+                    }
+                }
+
+                WtCommands::Rm {
+                    target,
+                    repo,
+                    force,
+                    sync,
+                } => {
+                    let report = wt_rm(&cfg, &target, repo.as_deref(), force, sync)?;
+                    if json {
+                        print_json(&report)?;
+                    } else {
+                        let mode = if report.cleaned_sync {
+                            "unlinked synchronously"
+                        } else {
+                            "unlinking in background"
+                        };
+                        println!(
+                            "Removed worktree '{}' in {:.2} ms ({mode})",
+                            report.slug, report.rename_ms
+                        );
+                    }
+                }
+
+                WtCommands::Prune {
+                    inactive,
+                    include_dirty,
+                    include_unpushed,
+                    all,
+                    repo,
+                    apply,
+                    sync,
+                } => {
+                    let report = wt_prune(
+                        &cfg,
+                        &WtPruneOptions {
+                            inactive,
+                            include_dirty,
+                            include_unpushed,
+                            all,
+                            repo_path: repo,
+                            apply,
+                            sync,
+                        },
+                    )?;
+                    if json {
+                        print_json(&report)?;
+                    } else {
+                        let prefix = if report.dry_run { "[dry-run] " } else { "" };
+                        println!(
+                            "{prefix}Prune (inactive >= {}): {} candidate(s) ({}), {} protected, {} active",
+                            report.inactive_threshold,
+                            report.pruned.len(),
+                            format_bytes(report.reclaimed_bytes),
+                            report.skipped_protected.len(),
+                            report.active_count
+                        );
+                        for w in &report.pruned {
+                            println!(
+                                "  {} {} (idle {}, {})",
+                                if report.dry_run {
+                                    "would remove"
+                                } else {
+                                    "removed"
+                                },
+                                w.slug,
+                                w.inactive_human,
+                                format_bytes(w.disk_bytes)
+                            );
+                        }
+                        for s in &report.skipped_protected {
+                            println!(
+                                "  skipped {} (idle {}, protected: {})",
+                                s.slug, s.inactive_human, s.reason
+                            );
+                        }
+                        if report.dry_run && !report.pruned.is_empty() {
+                            println!(
+                                "Re-run with `--apply` to remove these {} worktree(s).",
+                                report.pruned.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Commands::Gc { repo } => {
+            let cfg = CaissonConfig::load_from(&config_path)?;
+            let report = run_gc(&cfg, repo.as_deref())?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "GC complete: drained {} trash item(s) ({}), pruned {} repo(s), removed {} empty repo dir(s)",
+                    report.trash.entries_removed,
+                    format_bytes(report.trash.bytes_reclaimed),
+                    report.pruned_repos.len(),
+                    report.removed_empty_repo_dirs
+                );
             }
         }
     }
