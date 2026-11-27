@@ -1,0 +1,19 @@
+name: Feature Request
+description: Propose a new capability or ergonomics improvement
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow bottleneck
+      description: Describe the macOS development or multi-agent worktree pain point.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the CLI UX, config schema, or APFS behavior you envision.
+    validations:
+      required: true

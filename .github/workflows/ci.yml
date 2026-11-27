@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos-ci:
+    name: macOS (fmt, clippy, test, hygiene)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run unprivileged unit & integration test suite
+        run: cargo test
+
+      - name: Check repository hygiene (no local home paths in tracked source)
+        run: |
+          if grep -rnE '(/Users/[A-Za-z0-9._-]+|/home/[A-Za-z0-9._-]+)' src/ tests/ Cargo.toml; then
+            echo "ERROR: Local user home path detected in tracked source files."
+            exit 1
+          fi
