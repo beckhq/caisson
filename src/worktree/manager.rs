@@ -9,7 +9,10 @@ use crate::worktree::git::{
     prune_git_worktrees, sanitize_slug, worktree_current_branch, GitRepoContext,
 };
 use crate::worktree::quotas::{evaluate_add_quotas, measure_root_usage, QuotaSnapshot};
-use crate::worktree::trash::{allocated_dir_bytes, drain_trash, trash_worktree, TrashDrainReport};
+use crate::worktree::trash::{
+    allocated_dir_bytes, drain_trash, ensure_safe_trash_dir, trash_worktree, TrashDrainReport,
+    TrashResult,
+};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -60,6 +63,7 @@ pub struct WorktreeEntry {
     pub inactive_human: String,
     pub dirty: bool,
     pub unpushed: bool,
+    pub inspection_failed: bool,
     pub disk_bytes: u64,
     pub orphaned: bool,
 }
@@ -110,6 +114,25 @@ pub struct GcReport {
     pub removed_empty_repo_dirs: usize,
 }
 
+fn ensure_non_symlink_dir(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(CaissonError::Message(format!(
+                    "refusing to use symlink or non-directory for {label}: {}",
+                    path.display()
+                )));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path)?;
+            Ok(())
+        }
+        Err(e) => Err(CaissonError::Io(e)),
+    }
+}
+
 fn ensure_caisson_root_ready(caisson_root: &Path) -> Result<()> {
     if !caisson_root.exists() {
         return Err(CaissonError::Message(format!(
@@ -117,37 +140,103 @@ fn ensure_caisson_root_ready(caisson_root: &Path) -> Result<()> {
             caisson_root.display()
         )));
     }
-    fs::create_dir_all(caisson_root.join("worktrees"))?;
-    fs::create_dir_all(caisson_root.join(".trash"))?;
+    ensure_non_symlink_dir(&caisson_root.join("worktrees"), "worktrees root")?;
+    let _ = ensure_safe_trash_dir(caisson_root)?;
     Ok(())
 }
 
+/// Shared containment validation & atomic trashing routine used by BOTH `wt rm` and `wt prune`.
+/// Rejects symlinks at every managed component (`worktrees/`, `<repo-id>/`, `<slug>/`) and
+/// verifies canonical containment inside `<caisson_root>/worktrees/`.
+fn validate_and_trash_managed_worktree(
+    caisson_root: &Path,
+    wt_path: &Path,
+    sync: bool,
+) -> Result<TrashResult> {
+    let worktrees_base = caisson_root.join("worktrees");
+    let base_meta = fs::symlink_metadata(&worktrees_base)?;
+    if base_meta.file_type().is_symlink() || !base_meta.is_dir() {
+        return Err(CaissonError::Message(format!(
+            "refusing to operate on symlinked worktrees root: {}",
+            worktrees_base.display()
+        )));
+    }
+
+    let wt_meta = fs::symlink_metadata(wt_path)?;
+    if wt_meta.file_type().is_symlink() || !wt_meta.is_dir() {
+        return Err(CaissonError::Message(format!(
+            "refusing to remove symlink or non-directory worktree: {}",
+            wt_path.display()
+        )));
+    }
+
+    let repo_dir = wt_path.parent().ok_or_else(|| {
+        CaissonError::Message(format!(
+            "invalid managed worktree path: {}",
+            wt_path.display()
+        ))
+    })?;
+    let repo_meta = fs::symlink_metadata(repo_dir)?;
+    if repo_meta.file_type().is_symlink() || !repo_meta.is_dir() {
+        return Err(CaissonError::Message(format!(
+            "refusing to remove worktree under symlinked repository directory: {}",
+            repo_dir.display()
+        )));
+    }
+
+    let canonical_base = fs::canonicalize(&worktrees_base)?;
+    let canonical_repo = fs::canonicalize(repo_dir)?;
+    let canonical_wt = fs::canonicalize(wt_path)?;
+
+    if canonical_repo.parent() != Some(canonical_base.as_path())
+        || canonical_wt.parent() != Some(canonical_repo.as_path())
+        || !canonical_wt.starts_with(&canonical_base)
+    {
+        return Err(CaissonError::Message(format!(
+            "refusing to remove path outside Caisson worktrees root: {}",
+            canonical_wt.display()
+        )));
+    }
+
+    trash_worktree(caisson_root, &canonical_wt, sync)
+}
+
 /// Scan managed worktrees under `<caisson_root>/worktrees/`.
-/// When `repo_filter` is `Some(repo_id)`, limits scanning to that repository.
+/// Never follows symlinked `worktrees/`, `<repo-id>/`, or `<slug>/` directories.
 pub fn scan_managed_worktrees(
     caisson_root: &Path,
     repo_filter: Option<&str>,
     now: SystemTime,
 ) -> Result<Vec<WorktreeEntry>> {
     let worktrees_base = caisson_root.join("worktrees");
-    if !worktrees_base.exists() {
-        return Ok(Vec::new());
+    match fs::symlink_metadata(&worktrees_base) {
+        Ok(meta) if !meta.file_type().is_symlink() && meta.is_dir() => {}
+        Ok(_) => {
+            return Err(CaissonError::Message(format!(
+                "refusing to scan symlink or non-directory worktrees root: {}",
+                worktrees_base.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(CaissonError::Io(e)),
     }
 
     let mut results = Vec::new();
     let repo_dirs: Vec<(String, PathBuf)> = if let Some(rid) = repo_filter {
         let p = worktrees_base.join(rid);
-        if p.is_dir() {
-            vec![(rid.to_string(), p)]
-        } else {
-            Vec::new()
+        match fs::symlink_metadata(&p) {
+            Ok(meta) if !meta.file_type().is_symlink() && meta.is_dir() => {
+                vec![(rid.to_string(), p)]
+            }
+            _ => Vec::new(),
         }
     } else {
         fs::read_dir(&worktrees_base)?
             .flatten()
             .filter_map(|e| {
                 let p = e.path();
-                if p.is_dir() {
+                let meta = fs::symlink_metadata(&p).ok()?;
+                if !meta.file_type().is_symlink() && meta.is_dir() {
                     let id = e.file_name().to_string_lossy().into_owned();
                     Some((id, p))
                 } else {
@@ -163,7 +252,10 @@ pub fn scan_managed_worktrees(
         };
         for entry in slug_entries.flatten() {
             let wt_path = entry.path();
-            if !wt_path.is_dir() {
+            let Ok(wt_meta) = fs::symlink_metadata(&wt_path) else {
+                continue;
+            };
+            if wt_meta.file_type().is_symlink() || !wt_meta.is_dir() {
                 continue;
             }
             let slug = entry.file_name().to_string_lossy().into_owned();
@@ -190,6 +282,7 @@ pub fn scan_managed_worktrees(
                 inactive_human: format_age(inactive),
                 dirty: git_state.dirty,
                 unpushed: git_state.unpushed,
+                inspection_failed: git_state.inspection_failed,
                 disk_bytes,
                 orphaned,
             });
@@ -224,6 +317,7 @@ pub fn wt_add(config: &CaissonConfig, opts: &WtAddOptions) -> Result<WtAddReport
         .iter()
         .filter(|w| {
             w.inactive_secs >= default_inactive.as_secs()
+                && !w.inspection_failed
                 && (!config.prune.protect_dirty || !w.dirty)
                 && (!config.prune.protect_unpushed || !w.unpushed)
         })
@@ -248,9 +342,9 @@ pub fn wt_add(config: &CaissonConfig, opts: &WtAddOptions) -> Result<WtAddReport
     };
 
     let repo_wt_parent = caisson_root.join("worktrees").join(&repo.repo_id);
-    fs::create_dir_all(&repo_wt_parent)?;
+    ensure_non_symlink_dir(&repo_wt_parent, "repository worktree directory")?;
     let target_path = repo_wt_parent.join(&slug);
-    if target_path.exists() {
+    if target_path.exists() || fs::symlink_metadata(&target_path).is_ok() {
         return Err(CaissonError::Message(format!(
             "worktree target '{}' already exists (choose a different `--name` or remove it with `caisson wt rm {slug}`)",
             target_path.display()
@@ -319,7 +413,8 @@ pub fn wt_add(config: &CaissonConfig, opts: &WtAddOptions) -> Result<WtAddReport
 
 fn validate_relative_cow_entry(entry: &str) -> Result<PathBuf> {
     let p = Path::new(entry);
-    if p.is_absolute()
+    if p.as_os_str().is_empty()
+        || p.is_absolute()
         || p.components().any(|c| {
             matches!(
                 c,
@@ -328,10 +423,29 @@ fn validate_relative_cow_entry(entry: &str) -> Result<PathBuf> {
         })
     {
         return Err(CaissonError::Message(format!(
-            "unsafe `cow_copy` path '{entry}': must be relative to the worktree root"
+            "unsafe `cow_copy` path '{entry}': must be a non-empty path relative to the worktree root"
         )));
     }
     Ok(p.to_path_buf())
+}
+
+/// Verify that no existing ancestor component of `rel` under `base` is a symlink, and that
+/// the resolved parent stays strictly inside `canonical(base)`.
+fn ensure_no_symlink_escape(base: &Path, rel: &Path) -> Result<()> {
+    let mut cur = base.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp);
+        if let Ok(meta) = fs::symlink_metadata(&cur) {
+            if meta.file_type().is_symlink() {
+                return Err(CaissonError::Message(format!(
+                    "refusing to traverse symlink component '{}' inside '{}'",
+                    cur.display(),
+                    base.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cow_clone_entry(
@@ -353,8 +467,18 @@ fn cow_clone_entry(
         }
     };
 
+    // Guard destination against intermediate symlink escapes inside the new worktree.
+    if let Err(e) = ensure_no_symlink_escape(target_wt, &rel) {
+        return CowCloneOutcome {
+            entry: entry.to_string(),
+            source: None,
+            status: "skipped".to_string(),
+            detail: Some(e.to_string()),
+        };
+    }
+
     let dst = target_wt.join(&rel);
-    if dst.exists() {
+    if fs::symlink_metadata(&dst).is_ok() {
         return CowCloneOutcome {
             entry: entry.to_string(),
             source: None,
@@ -363,29 +487,42 @@ fn cow_clone_entry(
         };
     }
 
-    // Priority order for donor selection (all same-volume candidates first):
-    // 1. Warm cache: `<root>/cache/<repo-id>/<rel>` or `<root>/cache/<repo-name>/<rel>`
-    // 2. Sibling worktrees on `<root>/worktrees/<repo-id>/*/<rel>` (most recently active first)
-    // 3. Main repo `<main_repo>/<rel>` if on the same APFS volume
-    let mut candidates = vec![
-        caisson_root.join("cache").join(&repo.repo_id).join(&rel),
-        caisson_root.join("cache").join(&repo.repo_name).join(&rel),
+    // Priority order for donor selection (all same-volume candidates first, validated against symlink escape):
+    let mut candidate_roots: Vec<PathBuf> = vec![
+        caisson_root.join("cache").join(&repo.repo_id),
+        caisson_root.join("cache").join(&repo.repo_name),
     ];
-    for sib in siblings {
-        candidates.push(sib.join(&rel));
-    }
+    candidate_roots.extend(siblings.iter().cloned());
 
     let main_candidate = repo.main_repo_root.join(&rel);
     let mut cross_volume_main_exists = false;
-    if main_candidate.exists() {
+    if fs::symlink_metadata(&main_candidate).is_ok() {
         if same_volume(&main_candidate, target_wt).unwrap_or(false) {
-            candidates.push(main_candidate);
+            candidate_roots.push(repo.main_repo_root.clone());
         } else {
             cross_volume_main_exists = true;
         }
     }
 
-    let donor = candidates.into_iter().find(|p| p.exists());
+    let donor = candidate_roots.into_iter().find_map(|root| {
+        if !root.is_dir() {
+            return None;
+        }
+        let candidate = root.join(&rel);
+        if fs::symlink_metadata(&candidate).is_err() {
+            return None;
+        }
+        // Reject intermediate symlink traversal in donor root as well.
+        if let Some(rel_parent) = rel.parent() {
+            if !rel_parent.as_os_str().is_empty()
+                && ensure_no_symlink_escape(&root, rel_parent).is_err()
+            {
+                return None;
+            }
+        }
+        Some(candidate)
+    });
+
     let Some(donor_path) = donor else {
         let detail = if cross_volume_main_exists {
             format!(
@@ -416,6 +553,31 @@ fn cow_clone_entry(
                 detail: Some(e.to_string()),
             };
         }
+        // Verify canonical destination parent stays strictly inside canonical target_wt.
+        let Ok(canon_wt) = fs::canonicalize(target_wt) else {
+            return CowCloneOutcome {
+                entry: entry.to_string(),
+                source: Some(donor_path.display().to_string()),
+                status: "failed".to_string(),
+                detail: Some("failed to canonicalize target worktree".to_string()),
+            };
+        };
+        let Ok(canon_parent) = fs::canonicalize(parent) else {
+            return CowCloneOutcome {
+                entry: entry.to_string(),
+                source: Some(donor_path.display().to_string()),
+                status: "failed".to_string(),
+                detail: Some("failed to canonicalize destination parent".to_string()),
+            };
+        };
+        if !canon_parent.starts_with(&canon_wt) {
+            return CowCloneOutcome {
+                entry: entry.to_string(),
+                source: Some(donor_path.display().to_string()),
+                status: "skipped".to_string(),
+                detail: Some("destination parent escapes worktree root".to_string()),
+            };
+        }
     }
 
     match clone_path(&donor_path, &dst) {
@@ -435,6 +597,7 @@ fn cow_clone_entry(
 }
 
 /// List Caisson worktrees (for the current repo by default, or across all repos with `--all`).
+/// Never silently expands to all repositories when repo discovery fails unless `--all` is given.
 pub fn wt_ls(
     config: &CaissonConfig,
     repo_path: Option<&Path>,
@@ -452,7 +615,13 @@ pub fn wt_ls(
             Some(p) => p.to_path_buf(),
             None => std::env::current_dir()?,
         };
-        discover_repo(&cwd).ok().map(|r| r.repo_id)
+        let repo = discover_repo(&cwd).map_err(|_| {
+            CaissonError::Message(format!(
+                "'{}' is not inside a git repository; pass `--repo <path>` or `--all` to list worktrees across all repositories",
+                cwd.display()
+            ))
+        })?;
+        Some(repo.repo_id)
     };
 
     scan_managed_worktrees(&caisson_root, repo_filter.as_deref(), SystemTime::now())
@@ -481,6 +650,7 @@ pub fn wt_path(
 }
 
 /// Remove a worktree via instant `<1 ms` atomic rename to `.trash/<uuid>` + `git worktree prune`.
+/// Re-checks live git status immediately before trashing to avoid TOCTOU races.
 pub fn wt_rm(
     config: &CaissonConfig,
     target: &str,
@@ -499,22 +669,19 @@ pub fn wt_rm(
     let all_wts = scan_managed_worktrees(&caisson_root, None, SystemTime::now())?;
 
     let matched = resolve_worktree_target(target, &all_wts, current_repo.as_ref())?;
+    let wt_path = Path::new(&matched.path);
 
-    // Verify safety boundary: target MUST reside under `<caisson_root>/worktrees/`.
-    let canonical_wt = fs::canonicalize(&matched.path)?;
-    let canonical_base = fs::canonicalize(caisson_root.join("worktrees"))?;
-    if !canonical_wt.starts_with(&canonical_base) || canonical_wt == canonical_base {
-        return Err(CaissonError::Message(format!(
-            "refusing to remove path outside Caisson worktrees root: {}",
-            canonical_wt.display()
-        )));
+    // Re-inspect git state immediately prior to removal (prevents stale scan races & protects
+    // worktrees whose git inspection failed unless `--force` is explicitly provided).
+    if !force {
+        let owner_root = matched.main_repo_root.as_deref().map(Path::new);
+        let live_state = inspect_worktree_git_state(wt_path, owner_root);
+        if live_state.dirty || live_state.unpushed || live_state.inspection_failed {
+            return Err(CaissonError::WorktreeProtected(matched.slug.clone()));
+        }
     }
 
-    if !force && (matched.dirty || matched.unpushed) {
-        return Err(CaissonError::WorktreeProtected(matched.slug.clone()));
-    }
-
-    let trash_res = trash_worktree(&caisson_root, &canonical_wt, sync)?;
+    let trash_res = validate_and_trash_managed_worktree(&caisson_root, wt_path, sync)?;
 
     // Immediately deregister from git via `git worktree prune`.
     let pruned_repo = if let Some(ref owner) = matched.main_repo_root {
@@ -599,6 +766,9 @@ fn resolve_worktree_target(
 }
 
 /// Prune inactive worktrees (dry-run by default; pass `--apply` to remove).
+///
+/// Requires a valid git repository unless `--all` is explicitly passed, uses the same containment
+/// boundary check as `wt rm`, and re-inspects git state immediately before trashing each worktree.
 pub fn wt_prune(config: &CaissonConfig, opts: &WtPruneOptions) -> Result<WtPruneReport> {
     let threshold_str = opts
         .inactive
@@ -618,9 +788,11 @@ pub fn wt_prune(config: &CaissonConfig, opts: &WtPruneOptions) -> Result<WtPrune
         });
     }
 
+    // Propagate repo discovery errors unless `--all` is explicitly requested!
     let entries = wt_ls(config, opts.repo_path.as_deref(), opts.all)?;
     let protect_dirty = config.prune.protect_dirty && !opts.include_dirty;
     let protect_unpushed = config.prune.protect_unpushed && !opts.include_unpushed;
+    let protect_unknown = protect_dirty || protect_unpushed;
 
     let mut pruned = Vec::new();
     let mut skipped_protected = Vec::new();
@@ -634,12 +806,28 @@ pub fn wt_prune(config: &CaissonConfig, opts: &WtPruneOptions) -> Result<WtPrune
             continue;
         }
 
+        let wt_path = Path::new(&entry.path);
+        // Re-check live git state right before acting on this worktree.
+        let live_state = if opts.apply {
+            inspect_worktree_git_state(wt_path, entry.main_repo_root.as_deref().map(Path::new))
+        } else {
+            crate::worktree::git::WorktreeGitState {
+                dirty: entry.dirty,
+                unpushed: entry.unpushed,
+                inspection_failed: entry.inspection_failed,
+                inspection_error: None,
+            }
+        };
+
         let mut reasons = Vec::new();
-        if protect_dirty && entry.dirty {
+        if protect_dirty && live_state.dirty {
             reasons.push("dirty");
         }
-        if protect_unpushed && entry.unpushed {
+        if protect_unpushed && live_state.unpushed {
             reasons.push("unpushed");
+        }
+        if protect_unknown && live_state.inspection_failed {
+            reasons.push("unknown-git-state");
         }
 
         if !reasons.is_empty() {
@@ -655,7 +843,7 @@ pub fn wt_prune(config: &CaissonConfig, opts: &WtPruneOptions) -> Result<WtPrune
         reclaimed_bytes = reclaimed_bytes.saturating_add(entry.disk_bytes);
 
         if opts.apply {
-            let _ = trash_worktree(&caisson_root, Path::new(&entry.path), opts.sync)?;
+            let _ = validate_and_trash_managed_worktree(&caisson_root, wt_path, opts.sync)?;
             if let Some(ref owner) = entry.main_repo_root {
                 repos_to_prune.insert(PathBuf::from(owner));
             }
@@ -712,13 +900,17 @@ pub fn run_gc(config: &CaissonConfig, repo_path: Option<&Path>) -> Result<GcRepo
         }
     }
 
-    // Remove empty `<caisson_root>/worktrees/<repo-id>/` directories
+    // Remove empty `<caisson_root>/worktrees/<repo-id>/` directories (never following symlinks)
     let mut removed_empty_repo_dirs = 0usize;
     let worktrees_base = caisson_root.join("worktrees");
     if let Ok(entries) = fs::read_dir(&worktrees_base) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_dir()
+            let Ok(meta) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if !meta.file_type().is_symlink()
+                && meta.is_dir()
                 && fs::read_dir(&p)
                     .map(|mut rd| rd.next().is_none())
                     .unwrap_or(false)

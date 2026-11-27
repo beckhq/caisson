@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{CaissonError, Result};
 use serde::Serialize;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -23,23 +23,50 @@ pub struct TrashDrainReport {
     pub bytes_reclaimed: u64,
 }
 
+/// Ensure `<caisson_root>/.trash` is a real directory (never a symlink) inside `caisson_root`.
+pub fn ensure_safe_trash_dir(caisson_root: &Path) -> Result<PathBuf> {
+    let trash_dir = caisson_root.join(".trash");
+    match fs::symlink_metadata(&trash_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(CaissonError::Message(format!(
+                    "refusing to use symlink or non-directory as `.trash`: {}",
+                    trash_dir.display()
+                )));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&trash_dir)?;
+        }
+        Err(e) => return Err(CaissonError::Io(e)),
+    }
+    Ok(trash_dir)
+}
+
 /// Atomically move `target` into `<caisson_root>/.trash/<uuid>` (`rename(2)`, `<1 ms` on the same
 /// APFS volume) and either unlink it synchronously (`sync = true`) or spawn a detached background
 /// `rm -rf` worker (`sync = false`).
 pub fn trash_worktree(caisson_root: &Path, target: &Path, sync: bool) -> Result<TrashResult> {
-    let trash_dir = caisson_root.join(".trash");
-    fs::create_dir_all(&trash_dir)?;
+    let target_meta = fs::symlink_metadata(target)?;
+    if target_meta.file_type().is_symlink() || !target_meta.is_dir() {
+        return Err(CaissonError::Message(format!(
+            "refusing to trash symlink or non-directory: {}",
+            target.display()
+        )));
+    }
 
+    let trash_dir = ensure_safe_trash_dir(caisson_root)?;
     let trash_entry = trash_dir.join(Uuid::new_v4().to_string());
     let start = Instant::now();
     fs::rename(target, &trash_entry)?;
     let rename_ms = (start.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
 
     if sync {
-        if trash_entry.is_dir() {
-            fs::remove_dir_all(&trash_entry)?;
-        } else if trash_entry.exists() {
+        let entry_meta = fs::symlink_metadata(&trash_entry)?;
+        if entry_meta.file_type().is_symlink() || !entry_meta.is_dir() {
             fs::remove_file(&trash_entry)?;
+        } else {
+            fs::remove_dir_all(&trash_entry)?;
         }
     } else {
         spawn_detached_unlink(&trash_entry);
@@ -72,14 +99,26 @@ fn spawn_detached_unlink(path: &Path) {
 }
 
 /// Synchronously drain every pending item inside `<caisson_root>/.trash/`.
+/// Rejects a symlinked `.trash` directory and unlinks symlink entries without following them.
 pub fn drain_trash(caisson_root: &Path) -> Result<TrashDrainReport> {
     let trash_dir = caisson_root.join(".trash");
-    if !trash_dir.exists() {
-        return Ok(TrashDrainReport {
-            trash_dir: trash_dir.display().to_string(),
-            entries_removed: 0,
-            bytes_reclaimed: 0,
-        });
+    match fs::symlink_metadata(&trash_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(CaissonError::Message(format!(
+                    "refusing to drain symlink or non-directory `.trash`: {}",
+                    trash_dir.display()
+                )));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TrashDrainReport {
+                trash_dir: trash_dir.display().to_string(),
+                entries_removed: 0,
+                bytes_reclaimed: 0,
+            });
+        }
+        Err(e) => return Err(CaissonError::Io(e)),
     }
 
     let mut entries_removed = 0usize;
@@ -87,11 +126,14 @@ pub fn drain_trash(caisson_root: &Path) -> Result<TrashDrainReport> {
 
     for entry in fs::read_dir(&trash_dir)?.flatten() {
         let p = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&p) else {
+            continue;
+        };
         bytes_reclaimed = bytes_reclaimed.saturating_add(allocated_dir_bytes(&p));
-        let removed = if p.is_dir() {
-            fs::remove_dir_all(&p).is_ok()
-        } else {
+        let removed = if meta.file_type().is_symlink() || !meta.is_dir() {
             fs::remove_file(&p).is_ok()
+        } else {
+            fs::remove_dir_all(&p).is_ok()
         };
         if removed {
             entries_removed += 1;
@@ -112,7 +154,7 @@ pub fn allocated_dir_bytes(root: &Path) -> u64 {
     let Ok(meta) = fs::symlink_metadata(root) else {
         return 0;
     };
-    if !meta.is_dir() {
+    if meta.file_type().is_symlink() || !meta.is_dir() {
         let blocks_bytes = meta.blocks().saturating_mul(512);
         return if blocks_bytes > 0 {
             blocks_bytes
@@ -131,7 +173,7 @@ pub fn allocated_dir_bytes(root: &Path) -> u64 {
             let Ok(m) = fs::symlink_metadata(entry.path()) else {
                 continue;
             };
-            if m.is_dir() {
+            if !m.file_type().is_symlink() && m.is_dir() {
                 stack.push(entry.path());
             } else {
                 let blocks_bytes = m.blocks().saturating_mul(512);
@@ -149,6 +191,7 @@ pub fn allocated_dir_bytes(root: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
     #[test]
@@ -165,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_trash_cleans_leftover_entries() {
+    fn drain_trash_cleans_leftover_entries_and_rejects_symlink_trash_dir() {
         let root = tempdir().unwrap();
         let leftover = root.path().join(".trash/old-entry");
         fs::create_dir_all(&leftover).unwrap();
@@ -175,5 +218,13 @@ mod tests {
         assert_eq!(report.entries_removed, 1);
         assert!(report.bytes_reclaimed >= 4096);
         assert!(!leftover.exists());
+
+        // Symlinked `.trash` MUST be refused!
+        let root2 = tempdir().unwrap();
+        let victim = tempdir().unwrap();
+        fs::write(victim.path().join("keep.txt"), "safe").unwrap();
+        symlink(victim.path(), root2.path().join(".trash")).unwrap();
+        assert!(drain_trash(root2.path()).is_err());
+        assert!(victim.path().join("keep.txt").exists());
     }
 }

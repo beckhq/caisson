@@ -116,6 +116,10 @@ pub enum Commands {
         /// Recompute and print the JSON summary from an existing JSONL file and exit.
         #[arg(long)]
         summarize: Option<PathBuf>,
+
+        /// Allow appending to an existing non-empty `--out` JSONL file.
+        #[arg(long)]
+        append: bool,
     },
 
     /// Native APFS Copy-on-Write clone via Darwin `clonefile(2)` (`CLONE_NOFOLLOW`).

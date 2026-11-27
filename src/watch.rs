@@ -144,6 +144,7 @@ pub struct WatchOptions {
     pub watch_pid: Option<i32>,
     pub post_settle_secs: f64,
     pub summarize: Option<PathBuf>,
+    pub append: bool,
 }
 
 /// Check whether `pid` is alive and NOT a zombie (`Z`) process.
@@ -396,9 +397,37 @@ pub fn summarize_samples(rows: &[WatchSample]) -> Result<WatchSummary> {
     })
 }
 
-/// Compute the paired `.summary.json` path for a given JSONL path.
+/// Compute the paired `.summary.json` path for a given JSONL path, guaranteed distinct from `out_path`.
 pub fn summary_path_for(out_path: &Path) -> PathBuf {
-    out_path.with_extension("summary.json")
+    let candidate = out_path.with_extension("summary.json");
+    if candidate == out_path {
+        let mut s = out_path.as_os_str().to_os_string();
+        s.push(".summary.json");
+        PathBuf::from(s)
+    } else {
+        candidate
+    }
+}
+
+/// Validate finite, bounded sampling durations before touching the filesystem.
+fn validate_watch_durations(
+    interval_secs: f64,
+    post_settle_secs: f64,
+) -> Result<(Duration, Duration)> {
+    if !interval_secs.is_finite() || !(0.05..=86_400.0).contains(&interval_secs) {
+        return Err(CaissonError::Message(format!(
+            "invalid `--interval` value '{interval_secs}': must be finite and between 0.05 and 86400 seconds"
+        )));
+    }
+    if !post_settle_secs.is_finite() || !(0.0..=3_600.0).contains(&post_settle_secs) {
+        return Err(CaissonError::Message(format!(
+            "invalid `--post-settle` value '{post_settle_secs}': must be finite and between 0 and 3600 seconds"
+        )));
+    }
+    Ok((
+        Duration::from_secs_f64(interval_secs),
+        Duration::from_secs_f64(post_settle_secs),
+    ))
 }
 
 /// Execute `caisson watch`, either summarizing an existing JSONL or running the live sampler.
@@ -408,11 +437,25 @@ pub fn run_watch(opts: &WatchOptions) -> Result<(WatchSummary, Option<PathBuf>)>
         return Ok((summary, None));
     }
 
+    let (interval, post_settle) =
+        validate_watch_durations(opts.interval_secs, opts.post_settle_secs)?;
+
     let out_path = opts.out.as_ref().ok_or_else(|| {
         CaissonError::Message(
             "`--out <jsonl>` is required unless `--summarize` is given".to_string(),
         )
     })?;
+
+    if !opts.append {
+        if let Ok(meta) = fs::metadata(out_path) {
+            if meta.len() > 0 {
+                return Err(CaissonError::Message(format!(
+                    "output file '{}' already exists and is non-empty; choose a fresh `--out` path or pass `--append` explicitly",
+                    out_path.display()
+                )));
+            }
+        }
+    }
 
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -424,8 +467,6 @@ pub fn run_watch(opts: &WatchOptions) -> Result<(WatchSummary, Option<PathBuf>)>
     install_signal_handlers();
 
     let start = Instant::now();
-    let interval = Duration::from_secs_f64(opts.interval_secs.max(0.05));
-    let post_settle = Duration::from_secs_f64(opts.post_settle_secs.max(0.0));
 
     {
         let mut fh = OpenOptions::new()
@@ -445,7 +486,9 @@ pub fn run_watch(opts: &WatchOptions) -> Result<(WatchSummary, Option<PathBuf>)>
                 }
             }
 
-            let deadline = Instant::now() + interval;
+            let deadline = Instant::now()
+                .checked_add(interval)
+                .unwrap_or_else(Instant::now);
             while !STOP_REQUESTED.load(Ordering::SeqCst) && Instant::now() < deadline {
                 if let Some(pid) = opts.watch_pid {
                     if !pid_alive(pid) {
@@ -632,6 +675,7 @@ mod tests {
             watch_pid: Some(pid),
             post_settle_secs: 0.0,
             summarize: None,
+            append: false,
         };
         // Reap child in background so it doesn't stay a zombie forever, OR note `pid_alive` handles zombies!
         let reaper = std::thread::spawn(move || {
@@ -646,6 +690,20 @@ mod tests {
         let sp = summary_path.unwrap();
         assert!(sp.exists());
         assert!(out_path.exists());
+
+        // Reusing a non-empty output file without `--append` MUST fail cleanly.
+        assert!(run_watch(&opts).is_err());
+    }
+
+    #[test]
+    fn watch_rejects_non_finite_durations_and_keeps_summary_path_distinct() {
+        assert!(validate_watch_durations(f64::INFINITY, 1.0).is_err());
+        assert!(validate_watch_durations(f64::NAN, 1.0).is_err());
+        assert!(validate_watch_durations(1.0, f64::INFINITY).is_err());
+        assert!(validate_watch_durations(1.0, -1.0).is_err());
+
+        let same_ext = Path::new("/tmp/run.summary.json");
+        assert_ne!(summary_path_for(same_ext), same_ext);
     }
 
     #[test]

@@ -12,8 +12,42 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    name: Verify tag, formatting, Clippy, and tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml package version
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          PKG_VER="$(awk -F'"' '/^version =/{print $2; exit}' Cargo.toml)"
+          echo "Tag version: ${TAG_VER}, Cargo.toml version: ${PKG_VER}"
+          if [ "${TAG_VER}" != "${PKG_VER}" ]; then
+            echo "ERROR: Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${PKG_VER}."
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy (deny warnings)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run test suite
+        run: cargo test --locked
+
   build-universal-macos:
     name: Build universal macOS binary
+    needs: [verify]
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -27,12 +61,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build Apple Silicon (arm64) release binary
-        run: cargo build --release --target aarch64-apple-darwin
+        run: cargo build --release --locked --target aarch64-apple-darwin
 
       - name: Build Intel (x86_64) release binary
-        run: cargo build --release --target x86_64-apple-darwin
+        run: cargo build --release --locked --target x86_64-apple-darwin
 
-      - name: Create universal binary & checksums
+      - name: Create universal binary, verify version & checksums
         run: |
           mkdir -p dist
           lipo -create \
@@ -41,9 +75,16 @@ jobs:
             -output dist/caisson
           chmod +x dist/caisson
           file dist/caisson
-          dist/caisson --version
 
           TAG="${GITHUB_REF_NAME}"
+          EXPECTED="caisson ${TAG#v}"
+          ACTUAL="$(dist/caisson --version)"
+          echo "Binary reports: ${ACTUAL}"
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "ERROR: Expected '${EXPECTED}', got '${ACTUAL}'."
+            exit 1
+          fi
+
           ARCHIVE="caisson-${TAG}-universal-apple-darwin.tar.gz"
           tar -C dist -czf "dist/${ARCHIVE}" caisson
           (cd dist && shasum -a 256 "${ARCHIVE}" > SHA256SUMS.txt)

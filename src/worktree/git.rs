@@ -23,10 +23,13 @@ pub struct GitWorktreeInfo {
     pub locked: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
 pub struct WorktreeGitState {
     pub dirty: bool,
     pub unpushed: bool,
+    pub inspection_failed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inspection_error: Option<String>,
 }
 
 /// Deterministic 64-bit FNV-1a hash (first 8 hex chars) for collision-free repo IDs.
@@ -271,24 +274,53 @@ pub fn worktree_current_branch(wt_path: &Path) -> Option<String> {
         .map(|sha| format!("HEAD@{sha}"))
 }
 
-/// Detect whether a worktree has uncommitted changes (`dirty`) or unpushed commits (`unpushed`).
+/// Detect whether a worktree has uncommitted changes (`dirty`), unpushed commits (`unpushed`),
+/// or failed git inspection (`inspection_failed`, treated as protected unless overridden).
 pub fn inspect_worktree_git_state(
     wt_path: &Path,
     main_repo_root: Option<&Path>,
 ) -> WorktreeGitState {
     if !wt_path.exists() {
-        return WorktreeGitState::default();
+        return WorktreeGitState {
+            dirty: false,
+            unpushed: false,
+            inspection_failed: true,
+            inspection_error: Some("worktree path does not exist".to_string()),
+        };
     }
 
-    let dirty = run_git(wt_path, &["status", "--porcelain"])
-        .map(|out| !out.trim().is_empty())
-        .unwrap_or(false);
+    let dirty = match run_git(wt_path, &["status", "--porcelain"]) {
+        Ok(out) => !out.trim().is_empty(),
+        Err(e) => {
+            return WorktreeGitState {
+                dirty: false,
+                unpushed: false,
+                inspection_failed: true,
+                inspection_error: Some(format!("git status failed: {e}")),
+            };
+        }
+    };
 
-    let unpushed = detect_unpushed(wt_path, main_repo_root);
-    WorktreeGitState { dirty, unpushed }
+    match detect_unpushed(wt_path, main_repo_root) {
+        Ok(unpushed) => WorktreeGitState {
+            dirty,
+            unpushed,
+            inspection_failed: false,
+            inspection_error: None,
+        },
+        Err(e) => WorktreeGitState {
+            dirty,
+            unpushed: false,
+            inspection_failed: true,
+            inspection_error: Some(e),
+        },
+    }
 }
 
-fn detect_unpushed(wt_path: &Path, main_repo_root: Option<&Path>) -> bool {
+fn detect_unpushed(
+    wt_path: &Path,
+    main_repo_root: Option<&Path>,
+) -> std::result::Result<bool, String> {
     // 1. If an upstream tracking branch is configured, check commits ahead of `@{u}`.
     if run_git(
         wt_path,
@@ -296,49 +328,57 @@ fn detect_unpushed(wt_path: &Path, main_repo_root: Option<&Path>) -> bool {
     )
     .is_ok()
     {
-        return run_git(wt_path, &["rev-list", "--count", "@{u}..HEAD"])
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|n| n > 0)
-            .unwrap_or(false);
+        let out = run_git(wt_path, &["rev-list", "--count", "@{u}..HEAD"])
+            .map_err(|e| format!("git rev-list @{{u}}..HEAD failed: {e}"))?;
+        let count = out
+            .parse::<u64>()
+            .map_err(|_| format!("invalid rev-list count '{out}'"))?;
+        return Ok(count > 0);
     }
 
     // 2. No upstream configured: if any remote exists, check commits unreachable from `--remotes`.
-    let has_remotes = run_git(wt_path, &["remote"])
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    if has_remotes {
-        return run_git(
+    let remotes = run_git(wt_path, &["remote"]).map_err(|e| format!("git remote failed: {e}"))?;
+    if !remotes.trim().is_empty() {
+        let out = run_git(
             wt_path,
             &["rev-list", "--count", "HEAD", "--not", "--remotes"],
         )
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(|n| n > 0)
-        .unwrap_or(false);
+        .map_err(|e| format!("git rev-list --not --remotes failed: {e}"))?;
+        let count = out
+            .parse::<u64>()
+            .map_err(|_| format!("invalid rev-list count '{out}'"))?;
+        return Ok(count > 0);
     }
 
     // 3. Local-only repository (no remotes): compare HEAD against the primary checkout's branch.
-    let primary_branch = main_repo_root
-        .and_then(|root| run_git(root, &["symbolic-ref", "--short", "HEAD"]).ok())
-        .filter(|s| !s.is_empty());
-
-    if let Some(base_branch) = primary_branch {
-        let cur_branch = run_git(wt_path, &["symbolic-ref", "--short", "HEAD"]).ok();
-        if cur_branch.as_deref() == Some(base_branch.as_str()) {
-            return false;
-        }
-        return run_git(
-            wt_path,
-            &["rev-list", "--count", "HEAD", "--not", &base_branch],
-        )
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(|n| n > 0)
-        .unwrap_or(false);
+    let Some(root) = main_repo_root else {
+        return Err("owning main repository root could not be resolved".to_string());
+    };
+    if !root.exists() {
+        return Err(format!(
+            "owning main repository '{}' does not exist",
+            root.display()
+        ));
+    }
+    let base_branch = run_git(root, &["symbolic-ref", "--short", "HEAD"])
+        .map_err(|e| format!("could not determine primary branch in main repo: {e}"))?;
+    if base_branch.is_empty() {
+        return Err("primary branch name is empty".to_string());
     }
 
-    false
+    let cur_branch = run_git(wt_path, &["symbolic-ref", "--short", "HEAD"]).ok();
+    if cur_branch.as_deref() == Some(base_branch.as_str()) {
+        return Ok(false);
+    }
+    let out = run_git(
+        wt_path,
+        &["rev-list", "--count", "HEAD", "--not", &base_branch],
+    )
+    .map_err(|e| format!("git rev-list --not {base_branch} failed: {e}"))?;
+    let count = out
+        .parse::<u64>()
+        .map_err(|_| format!("invalid rev-list count '{out}'"))?;
+    Ok(count > 0)
 }
 
 #[cfg(test)]

@@ -534,3 +534,127 @@ fn wt_path_completions_and_shell_init_work() {
     assert!(init_str.contains("caisson wt path"));
     assert!(init_str.contains("alias cai=caisson"));
 }
+
+#[test]
+fn review_regressions_prune_scope_git_failure_and_symlink_containment() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = tempdir().unwrap();
+    let repo_dir = sandbox.path().join("safety-repo");
+    let non_git_dir = sandbox.path().join("not-a-git-repo");
+    let outside_dir = sandbox.path().join("outside-victim");
+    let caisson_root = sandbox.path().join("mock-caisson-vol");
+    let config_path = sandbox.path().join("config.toml");
+    fs::create_dir_all(&non_git_dir).unwrap();
+    fs::create_dir_all(outside_dir.join("child")).unwrap();
+    fs::write(outside_dir.join("child/keep.txt"), "do-not-delete").unwrap();
+    fs::create_dir_all(&caisson_root).unwrap();
+
+    init_sample_repo(&repo_dir);
+    assert!(run_caisson(
+        &repo_dir,
+        &caisson_root,
+        &config_path,
+        &["config", "set", "quotas.min_host_free", "0G"],
+    )
+    .status
+    .success());
+
+    // Add a clean worktree.
+    let add = run_caisson(
+        &repo_dir,
+        &caisson_root,
+        &config_path,
+        &["wt", "add", "feat/keep-safe", "--json"],
+    );
+    assert!(add.status.success());
+    let add_json: Value = serde_json::from_slice(&add.stdout).unwrap();
+    let wt_path = PathBuf::from(add_json["path"].as_str().unwrap());
+
+    // 1. Running `wt prune --inactive 0s --apply` outside a git repo MUST fail and NOT touch worktrees!
+    let prune_outside = run_caisson(
+        &non_git_dir,
+        &caisson_root,
+        &config_path,
+        &["wt", "prune", "--inactive", "0s", "--apply", "--sync"],
+    );
+    assert!(!prune_outside.status.success());
+    assert!(wt_path.exists());
+
+    // 2. Plant a symlinked repo dir inside `<caisson_root>/worktrees/` pointing outside ->
+    //    `wt prune --all --inactive 0s --apply` MUST NOT touch `outside-victim/child`!
+    symlink(&outside_dir, caisson_root.join("worktrees/evil-link")).unwrap();
+
+    // 3. Corrupt the worktree's `.git` pointer so git inspection fails ->
+    //    BOTH `wt rm` (without `--force`) AND `wt prune --apply` MUST protect it!
+    fs::write(wt_path.join(".git"), "gitdir: /nonexistent/broken/gitdir\n").unwrap();
+
+    let rm_broken = run_caisson(
+        &repo_dir,
+        &caisson_root,
+        &config_path,
+        &["wt", "rm", "feat-keep-safe"],
+    );
+    assert!(
+        !rm_broken.status.success(),
+        "wt rm must refuse when git inspection fails"
+    );
+    assert!(wt_path.exists());
+
+    let prune_broken = run_caisson(
+        &repo_dir,
+        &caisson_root,
+        &config_path,
+        &[
+            "wt",
+            "prune",
+            "--all",
+            "--inactive",
+            "0s",
+            "--apply",
+            "--sync",
+            "--json",
+        ],
+    );
+    assert!(prune_broken.status.success());
+    let prune_json: Value = serde_json::from_slice(&prune_broken.stdout).unwrap();
+    assert_eq!(prune_json["pruned"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        prune_json["skipped_protected"][0]["reason"],
+        "unknown-git-state"
+    );
+    assert!(wt_path.exists());
+    // Outside symlink victim MUST remain untouched!
+    assert_eq!(
+        fs::read_to_string(outside_dir.join("child/keep.txt")).unwrap(),
+        "do-not-delete"
+    );
+
+    // 4. `cow_copy` intermediate symlink escape MUST be blocked!
+    let escape_target = sandbox.path().join("escape-target");
+    fs::create_dir_all(&escape_target).unwrap();
+    let repo2 = sandbox.path().join("cow-escape-repo");
+    init_sample_repo(&repo2);
+    symlink(&escape_target, repo2.join("vendor")).unwrap();
+    fs::write(
+        repo2.join(".caisson.toml"),
+        "[worktree]\ncow_copy = [\"vendor/deps\"]\n",
+    )
+    .unwrap();
+    run_git(&repo2, &["add", "vendor", ".caisson.toml"]);
+    run_git(&repo2, &["commit", "-m", "add symlink vendor"]);
+    let warm = caisson_root.join("cache/cow-escape-repo/vendor/deps");
+    fs::create_dir_all(&warm).unwrap();
+    fs::write(warm.join("x.txt"), "payload").unwrap();
+
+    let add_escape = run_caisson(
+        &repo2,
+        &caisson_root,
+        &config_path,
+        &["wt", "add", "feat/escape-test", "--json"],
+    );
+    assert!(add_escape.status.success());
+    let esc_json: Value = serde_json::from_slice(&add_escape.stdout).unwrap();
+    assert_eq!(esc_json["cow_clones"][0]["status"], "skipped");
+    assert!(!escape_target.join("deps").exists());
+}
