@@ -751,11 +751,19 @@ pub fn build_status_report(registry_path: &Path, config: &CaissonConfig) -> Resu
             a.containers
                 .iter()
                 .filter(|c| {
-                    // Exclude Apple firmware/recovery-only system containers (`iSCPreboot`, `Recovery`, etc.).
-                    c.volumes.iter().any(|v| {
+                    // Exclude Apple firmware/recovery-only system containers (`iSCPreboot`, `Recovery`, etc.)
+                    // and virtual read-only disk images (`.dmg`, macOS cryptexes, Xcode runtimes).
+                    let has_user_vol = c.volumes.iter().any(|v| {
                         v.has_protected_role().is_none()
                             || v.roles.iter().any(|r| r.eq_ignore_ascii_case("Data"))
-                    })
+                    });
+                    if !has_user_vol {
+                        return false;
+                    }
+                    let is_virtual_image = diskutil_info(&c.container_reference)
+                        .map(|i| i.is_disk_image() || i.writable_media == Some(false))
+                        .unwrap_or(false);
+                    !is_virtual_image
                 })
                 .map(ContainerSummary::from_apfs)
                 .collect()

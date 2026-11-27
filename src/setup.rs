@@ -1,6 +1,6 @@
 use crate::agents::{dismiss_agents, inspect_agents, install_agent_skills, resolve_user_home};
 use crate::apfs::diskutil::{
-    compute_auto_quota, detect_internal_container, is_external_container, list_apfs,
+    compute_auto_quota, detect_internal_container, diskutil_info, list_apfs, validate_volume_name,
 };
 use crate::apfs::statfs::{is_root, statfs_path};
 use crate::apfs::volume::{
@@ -309,13 +309,15 @@ fn verify_no_symlink_components(base: &Path, rel: &Path) -> Result<()> {
 
 /// Resolve and verify the current executable before elevating with `/usr/bin/sudo`:
 /// requires a canonical regular file whose binary and ancestor chain are owned by root or the
-/// current effective UID and have no group/world write permissions (`mode & 0o022 == 0`).
-fn resolve_self_exe() -> Result<PathBuf> {
+/// current effective UID, are never world-writable (unless sticky), and only allow group-write
+/// for trusted macOS system/Homebrew groups (`wheel` = 0, `admin` = 80, or the current primary gid).
+pub fn verify_elevatable_executable(path: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::MetadataExt;
 
-    let exe = std::env::current_exe()?;
-    let canonical = fs::canonicalize(&exe)?;
+    let canonical = fs::canonicalize(path)?;
     let my_uid = unsafe { libc::geteuid() };
+    let my_gid = unsafe { libc::getegid() };
+    let is_trusted_group = |gid: u32| gid == 0 || gid == 80 || gid == my_gid;
 
     let meta = fs::symlink_metadata(&canonical)?;
     if !meta.is_file() {
@@ -324,26 +326,31 @@ fn resolve_self_exe() -> Result<PathBuf> {
             canonical.display()
         )));
     }
-    if (meta.uid() != 0 && meta.uid() != my_uid) || (meta.mode() & 0o022) != 0 {
+    let bin_mode = meta.mode();
+    let bin_world_w = (bin_mode & 0o002) != 0;
+    let bin_untrusted_group_w = (bin_mode & 0o020) != 0 && !is_trusted_group(meta.gid());
+    if (meta.uid() != 0 && meta.uid() != my_uid) || bin_world_w || bin_untrusted_group_w {
         return Err(CaissonError::Message(format!(
-            "refusing to elevate writable or foreign-owned executable '{}' (uid={}, mode={:o})",
+            "refusing to elevate writable or foreign-owned executable '{}' (uid={}, gid={}, mode={:o})",
             canonical.display(),
             meta.uid(),
-            meta.mode() & 0o777
+            meta.gid(),
+            bin_mode & 0o777
         )));
     }
     let mut anc = canonical.parent();
     while let Some(dir) = anc {
         if let Ok(dm) = fs::symlink_metadata(dir) {
-            // Allow standard sticky `/tmp` or root-owned dirs; reject group/world writable non-sticky dirs
-            // or dirs owned by another non-root user.
             let mode = dm.mode();
             let sticky = (mode & libc::S_ISVTX as u32) != 0;
-            if (dm.uid() != 0 && dm.uid() != my_uid) || ((mode & 0o022) != 0 && !sticky) {
+            let world_w = (mode & 0o002) != 0 && !sticky;
+            let untrusted_group_w = (mode & 0o020) != 0 && !sticky && !is_trusted_group(dm.gid());
+            if (dm.uid() != 0 && dm.uid() != my_uid) || world_w || untrusted_group_w {
                 return Err(CaissonError::Message(format!(
-                    "refusing to elevate executable under writable or foreign-owned directory '{}' (uid={}, mode={:o})",
+                    "refusing to elevate executable under writable or foreign-owned directory '{}' (uid={}, gid={}, mode={:o})",
                     dir.display(),
                     dm.uid(),
+                    dm.gid(),
                     mode & 0o777
                 )));
             }
@@ -351,6 +358,11 @@ fn resolve_self_exe() -> Result<PathBuf> {
         anc = dir.parent();
     }
     Ok(canonical)
+}
+
+fn resolve_self_exe() -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    verify_elevatable_executable(&exe)
 }
 
 fn discover_drive_choices(registered: &[VolumeStatusEntry]) -> Vec<(DriveChoice, SelectOption)> {
@@ -386,6 +398,9 @@ fn discover_drive_choices(registered: &[VolumeStatusEntry]) -> Vec<(DriveChoice,
         }
     }
 
+    let has_existing = !choices.is_empty();
+    let create_prefix = if has_existing { "Create new on " } else { "" };
+
     if let Ok(apfs) = list_apfs() {
         // Internal container first (default on fresh install).
         if let Ok(internal) = detect_internal_container() {
@@ -402,7 +417,10 @@ fn discover_drive_choices(registered: &[VolumeStatusEntry]) -> Vec<(DriveChoice,
                     capacity_ceiling: internal.capacity_ceiling,
                 },
                 SelectOption {
-                    label: format!("Internal Mac SSD ({})", internal.container_reference),
+                    label: format!(
+                        "{create_prefix}Internal Mac SSD ({})",
+                        internal.container_reference
+                    ),
                     detail: Some(format!(
                         "[{}] {}% used · {} free / {}",
                         bar_meter(frac, 18),
@@ -415,25 +433,49 @@ fn discover_drive_choices(registered: &[VolumeStatusEntry]) -> Vec<(DriveChoice,
             ));
         }
 
-        // External APFS containers with at least one mounted volume.
+        // Physical writable external APFS containers mounted under `/Volumes/...`.
+        // Explicitly filters out virtual disk images (`.dmg`, macOS cryptexes, Xcode
+        // Simulator runtimes) and read-only media so only real user drives appear.
         for c in &apfs.containers {
-            if !is_external_container(&c.container_reference) {
-                continue;
-            }
-            let mounted_vol = c.volumes.iter().find(|v| {
-                v.mount_point
-                    .as_deref()
-                    .map(|mp| mp.starts_with("/Volumes/"))
-                    .unwrap_or(false)
-            });
-            let Some(mv) = mounted_vol else {
+            let Ok(c_info) = diskutil_info(&c.container_reference) else {
                 continue;
             };
-            let mp = mv.mount_point.as_deref().unwrap_or("");
-            let drive_label = Path::new(mp)
+            if c_info.internal != Some(false)
+                || c_info.is_disk_image()
+                || c_info.writable_media == Some(false)
+            {
+                continue;
+            }
+            let primary_vol = c
+                .volumes
+                .iter()
+                .find(|v| {
+                    let vn = v.name.as_deref().unwrap_or("");
+                    !existing_names.iter().any(|n| n.eq_ignore_ascii_case(vn))
+                })
+                .or_else(|| c.volumes.first());
+            let Some(pv) = primary_vol else {
+                continue;
+            };
+            let pv_name = pv.name.as_deref().unwrap_or("ssd");
+            let live_mount = pv
+                .mount_point
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    diskutil_info(&pv.device_identifier)
+                        .ok()
+                        .and_then(|info| info.mount_point)
+                        .filter(|s| !s.is_empty())
+                });
+            let Some(mp) = live_mount.filter(|m| m.starts_with("/Volumes/")) else {
+                continue;
+            };
+            let drive_label = Path::new(&mp)
                 .file_name()
                 .and_then(|s| s.to_str())
-                .unwrap_or("ssd");
+                .filter(|s| !s.is_empty())
+                .unwrap_or(if pv_name.is_empty() { "ssd" } else { pv_name });
             let ceiling = c.capacity_ceiling.max(1);
             let used = ceiling.saturating_sub(c.capacity_free);
             let frac = used as f64 / ceiling as f64;
@@ -448,9 +490,9 @@ fn discover_drive_choices(registered: &[VolumeStatusEntry]) -> Vec<(DriveChoice,
                 },
                 SelectOption {
                     label: format!(
-                        "External APFS SSD ({} -> {})",
+                        "{create_prefix}External APFS SSD ({} -> {})",
                         sanitize_display_label(&c.container_reference),
-                        sanitize_display_label(mp)
+                        sanitize_display_label(&mp)
                     ),
                     detail: Some(format!(
                         "[{}] {}% used · {} free / {}",
@@ -554,11 +596,19 @@ pub fn run_setup(
                     );
                     suggested_name
                 } else {
-                    input_line(
-                        "Volume name (canonical `/Volumes/caisson` already exists)",
-                        &suggested_name,
-                        &pal,
-                    )?
+                    loop {
+                        let candidate = input_line(
+                            "Volume name (canonical `/Volumes/caisson` already exists)",
+                            &suggested_name,
+                            &pal,
+                        )?;
+                        match validate_volume_name(&candidate) {
+                            Ok(()) => break candidate,
+                            Err(e) => {
+                                print_rail_line(&format!("{} {e}", pal.warn("!")), &pal);
+                            }
+                        }
+                    }
                 };
 
                 let quota_opts = vec![
@@ -687,9 +737,7 @@ pub fn run_setup(
             print_rail_line(&format!("  {}", pal.accent(&cmd_str)), &pal);
             planned_commands.push(cmd_str);
             if opts.dry_run {
-                if let Ok(d_rep) =
-                    install_daemon(Some(&self_exe), Path::new(LAUNCH_DAEMON_PLIST_PATH), true)
-                {
+                if let Ok(d_rep) = install_daemon(None, Path::new(LAUNCH_DAEMON_PLIST_PATH), true) {
                     for c in &d_rep.commands {
                         print_rail_line(&format!("    {}", pal.dim(c)), &pal);
                         planned_commands.push(c.clone());
@@ -813,7 +861,39 @@ pub fn run_setup(
                 }
             }
             Err(e) => {
-                print_rail_line(&format!("{} Skipped ~/{rc_rel}: {e}", pal.warn("!")), &pal);
+                let rc_full = home.join(rc_rel);
+                if fs::symlink_metadata(&rc_full)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    let already_present = fs::metadata(&rc_full)
+                        .ok()
+                        .filter(|m| m.is_file() && m.len() <= 4 * 1024 * 1024)
+                        .and_then(|_| fs::read_to_string(&rc_full).ok())
+                        .map(|s| s.contains("caisson shell-init"))
+                        .unwrap_or(false);
+                    if already_present {
+                        print_rail_line(
+                            &format!(
+                                "{} Shell hook already present in ~/{rc_rel} (dotfiles symlink)",
+                                pal.ok("✓")
+                            ),
+                            &pal,
+                        );
+                        shell_configured = Some(format!("~/{rc_rel} (existing)"));
+                    } else {
+                        print_rail_line(
+                            &format!(
+                                "{} ~/{rc_rel} is a symlink (dotfiles-managed); add this line manually:",
+                                pal.warn("!")
+                            ),
+                            &pal,
+                        );
+                        print_rail_line(&format!("  {}", pal.accent(shell.init_line())), &pal);
+                    }
+                } else {
+                    print_rail_line(&format!("{} Skipped ~/{rc_rel}: {e}", pal.warn("!")), &pal);
+                }
             }
         }
     }
@@ -900,11 +980,18 @@ pub fn run_setup(
     );
 
     // -------------------------------------------------------------------------
-    // Step 4: T3 Code worktrees & live syspolicyd exec probe (unprivileged)
+    // Step 4: Optional T3 Code worktrees & live syspolicyd exec probe (unprivileged)
     // -------------------------------------------------------------------------
-    print_step_header(4, 5, "T3 Code Worktrees & Live syspolicyd Exec Probe", &pal);
+    let check_t3 = !opts.no_t3 && is_t3_installed(&home);
+    let step4_title = match (check_t3, !opts.no_probe) {
+        (true, true) => "T3 Code Worktrees & Live syspolicyd Exec Probe",
+        (true, false) => "T3 Code Worktrees",
+        (false, true) => "Live syspolicyd Exec Probe",
+        (false, false) => "Verification (skipped)",
+    };
+    print_step_header(4, 5, step4_title, &pal);
     let mut t3_configured = None;
-    if !opts.no_t3 && is_t3_installed(&home) {
+    if check_t3 {
         let already_on_vol = resolve_t3_worktrees_dir(&home)
             .and_then(|d| statfs_path(&d).ok())
             .map(|st| st.mount_point == volume_mount)
@@ -996,7 +1083,18 @@ pub fn run_setup(
                     &pal,
                 );
             }
-            if !opts.dry_run
+            let over_ssh = std::env::var_os("SSH_CONNECTION").is_some()
+                || std::env::var_os("SSH_TTY").is_some()
+                || p.responsible_process
+                    .as_deref()
+                    .map(|s| s.starts_with("sshd"))
+                    .unwrap_or(false);
+            if over_ssh {
+                print_rail_line(
+                    &pal.dim("Running over SSH; enable Developer Tools in System Settings on the Mac desktop if needed."),
+                    &pal,
+                );
+            } else if !opts.dry_run
                 && confirm(
                     "Open System Settings -> Privacy & Security -> Developer Tools now?",
                     false,
@@ -1017,7 +1115,13 @@ pub fn run_setup(
             );
         }
     }
-    print_step_done("T3 & exec probe complete", &pal);
+    let step4_done = match (check_t3, !opts.no_probe) {
+        (true, true) => "T3 & exec probe complete",
+        (true, false) => "T3 check complete",
+        (false, true) => "Exec probe complete",
+        (false, false) => "Skipped",
+    };
+    print_step_done(step4_done, &pal);
 
     // -------------------------------------------------------------------------
     // Step 5: Sealed-Chamber Summary Card
@@ -1032,25 +1136,43 @@ pub fn run_setup(
             "CAISSON CHAMBER SEALED & READY"
         })
     );
-    println!("  ┌──────────────────────────────────────────────────────────────┐");
-    println!("  │  Volume       {}  {}", pal.ok("● READY"), volume_mount);
-    println!(
-        "  │  LaunchDaemon {}  {}",
-        if daemon_installed {
-            pal.ok("● LOADED")
-        } else {
-            pal.dim("○ SKIPPED")
-        },
-        if daemon_installed {
-            "dev.caisson.mount (boot + StartOnMount)"
-        } else {
-            "run `sudo caisson daemon install` later"
-        }
-    );
+    println!("  ┌──────────────────────────────────────────────────────────────");
+    let vol_badge = if needs_create && opts.dry_run {
+        pal.accent("● PLANNED")
+    } else {
+        pal.ok("● READY  ")
+    };
+    println!("  │  Volume       {vol_badge}  {volume_mount}");
+    let (daemon_badge, daemon_desc) = if daemon_installed {
+        (
+            pal.ok("● LOADED "),
+            "dev.caisson.mount (boot + StartOnMount)",
+        )
+    } else if want_daemon && opts.dry_run {
+        (
+            pal.accent("● PLANNED"),
+            "sudo caisson daemon install (boot + StartOnMount)",
+        )
+    } else {
+        (
+            pal.dim("○ SKIPPED"),
+            "run `sudo caisson daemon install` later",
+        )
+    };
+    println!("  │  LaunchDaemon {daemon_badge}  {daemon_desc}");
     println!(
         "  │  Shell Hook   {}  {}",
         if shell_configured.is_some() {
-            pal.ok("● ACTIVE")
+            if opts.dry_run
+                && !shell_configured
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("existing")
+            {
+                pal.accent("● PLANNED")
+            } else {
+                pal.ok("● ACTIVE ")
+            }
         } else {
             pal.dim("○ SKIPPED")
         },
@@ -1061,9 +1183,9 @@ pub fn run_setup(
     println!(
         "  │  Agent Skills {}  {}",
         if !agents_installed.is_empty() {
-            pal.ok("● SYNCED")
+            pal.ok("● SYNCED ")
         } else {
-            pal.dim("○ NONE")
+            pal.dim("○ NONE   ")
         },
         if agents_installed.is_empty() {
             "run `caisson agent install` anytime".to_string()
@@ -1072,20 +1194,25 @@ pub fn run_setup(
         }
     );
     if let Some(ref t3) = t3_configured {
-        println!("  │  T3 Worktrees {}  {}", pal.ok("● SHIELDED"), t3);
+        let t3_badge = if opts.dry_run && t3.contains("dry-run") {
+            pal.accent("● PLANNED ")
+        } else {
+            pal.ok("● SHIELDED")
+        };
+        println!("  │  T3 Worktrees {t3_badge} {t3}");
     }
     if let Some(ref p) = syspolicyd_probe {
         let badge = if p.stalled {
             pal.warn("▲ STALLED")
         } else {
-            pal.ok("● FAST")
+            pal.ok("● FAST   ")
         };
         println!(
             "  │  Exec Probe   {}  {:.1} ms 1st vs {:.1} ms cached",
             badge, p.first_exec_ms, p.cached_exec_ms
         );
     }
-    println!("  └──────────────────────────────────────────────────────────────┘");
+    println!("  └──────────────────────────────────────────────────────────────");
     println!(
         "  {}  {}  ·  {}  ·  {}",
         pal.dim("Try it now:"),
@@ -1154,5 +1281,35 @@ mod tests {
         symlink(&victim, home.join(".bashrc")).unwrap();
         assert!(append_shell_init_line(home, DetectedShell::Bash, false).is_err());
         assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched\n");
+    }
+
+    #[test]
+    fn verify_elevatable_executable_allows_homebrew_775_and_rejects_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        // Simulate Homebrew `0775` directory owned by current user/group.
+        let cellar = dir.path().join("Cellar");
+        fs::create_dir(&cellar).unwrap();
+        fs::set_permissions(&cellar, fs::Permissions::from_mode(0o775)).unwrap();
+        let bin = cellar.join("caisson");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(verify_elevatable_executable(&bin).is_ok());
+
+        // World-writable non-sticky parent directory must be rejected.
+        let world_dir = dir.path().join("world");
+        fs::create_dir(&world_dir).unwrap();
+        fs::set_permissions(&world_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let bad_bin = world_dir.join("caisson");
+        fs::write(&bad_bin, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&bad_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(verify_elevatable_executable(&bad_bin).is_err());
+
+        // If Homebrew caisson is installed on this Mac, verify it passes cleanly.
+        let brew_bin = Path::new("/opt/homebrew/bin/caisson");
+        if brew_bin.exists() {
+            assert!(verify_elevatable_executable(brew_bin).is_ok());
+        }
     }
 }

@@ -266,6 +266,43 @@ fn read_key() -> Result<Key> {
     read_key_from_fd(io::stdin().as_raw_fd())
 }
 
+fn terminal_cols() -> usize {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(io::stdout().as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
+    if rc == 0 && ws.ws_col > 0 {
+        ws.ws_col as usize
+    } else {
+        80
+    }
+}
+
+/// Count visible character columns in a line after stripping ANSI CSI SGR sequences.
+fn visible_columns(line: &str) -> usize {
+    let mut count = 0usize;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for esc in chars.by_ref() {
+                if esc.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        count += 1;
+    }
+    count
+}
+
+fn rendered_row_count(lines: &[String]) -> usize {
+    let cols = terminal_cols().max(20);
+    lines
+        .iter()
+        .map(|l| visible_columns(l).max(1).div_ceil(cols))
+        .sum()
+}
+
 fn clear_rendered_lines(count: usize) {
     if count == 0 {
         return;
@@ -352,7 +389,7 @@ pub fn select_one(
             println!("{l}");
         }
         let _ = io::stdout().flush();
-        prev_lines = lines.len();
+        prev_lines = rendered_row_count(&lines);
 
         match read_key()? {
             Key::Up => {
@@ -439,7 +476,7 @@ pub fn multi_select(prompt: &str, items: &mut [ToggleOption], pal: &Palette) -> 
             println!("{l}");
         }
         let _ = io::stdout().flush();
-        prev_lines = lines.len();
+        prev_lines = rendered_row_count(&lines);
 
         match read_key()? {
             Key::Up => {

@@ -106,12 +106,34 @@ pub struct DiskutilInfoPlist {
     pub capacity_in_use: Option<u64>,
     #[serde(rename = "Internal", default)]
     pub internal: Option<bool>,
+    #[serde(rename = "BusProtocol", default)]
+    pub bus_protocol: Option<String>,
+    #[serde(rename = "MediaName", default)]
+    pub media_name: Option<String>,
+    #[serde(rename = "WritableMedia", default)]
+    pub writable_media: Option<bool>,
     #[serde(rename = "FilesystemType", default)]
     pub filesystem_type: Option<String>,
     #[serde(rename = "FilesystemUserVisibleName", default)]
     pub filesystem_user_visible_name: Option<String>,
     #[serde(rename = "WritableVolume", default)]
     pub writable_volume: Option<bool>,
+}
+
+impl DiskutilInfoPlist {
+    /// Returns true if this disk/container is a virtual disk image (`.dmg`, `.sparseimage`,
+    /// macOS cryptex, Xcode Simulator runtime, etc.) rather than a physical drive.
+    pub fn is_disk_image(&self) -> bool {
+        self.bus_protocol
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case("Disk Image"))
+            .unwrap_or(false)
+            || self
+                .media_name
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case("Disk Image"))
+                .unwrap_or(false)
+    }
 }
 
 impl ApfsVolume {
