@@ -269,7 +269,8 @@ pub fn owner_repo_root_from_worktree(wt_path: &Path) -> Option<PathBuf> {
 }
 
 /// Read the currently checked-out branch name (or detached HEAD short SHA) for a worktree.
-/// Fast path reads `<admin_dir>/HEAD` directly without spawning a git subprocess.
+/// Fast path reads `<admin_dir>/HEAD` directly for symbolic branches without spawning git;
+/// detached HEADs fall through to `git rev-parse --short HEAD` to preserve Git's abbreviation.
 pub fn worktree_current_branch(wt_path: &Path) -> Option<String> {
     if let Some(admin) = resolve_worktree_admin_dir(wt_path) {
         if let Ok(head) = fs::read_to_string(admin.join("HEAD")) {
@@ -278,8 +279,6 @@ pub fn worktree_current_branch(wt_path: &Path) -> Option<String> {
                 if !branch.is_empty() {
                     return Some(branch.to_string());
                 }
-            } else if trimmed.len() >= 7 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some(format!("HEAD@{}", &trimmed[..7]));
             }
         }
     }

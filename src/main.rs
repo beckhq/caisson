@@ -586,7 +586,17 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
 
         Commands::Wt { action } => {
-            auto_sync_installed_skills(&config_path, json);
+            // Only run passive skill auto-sync on mutating worktree commands (never on `--dry-run`,
+            // preview-only `wt prune`, or read-only `wt ls`/`wt path`).
+            let should_sync = match &action {
+                WtCommands::Add { .. } | WtCommands::Rm { .. } => true,
+                WtCommands::Prune { apply, .. } => *apply,
+                WtCommands::Hydrate { dry_run, .. } => !*dry_run,
+                WtCommands::Ls { .. } | WtCommands::Path { .. } => false,
+            };
+            if should_sync {
+                auto_sync_installed_skills(&config_path, json);
+            }
             let cfg = CaissonConfig::load_from(&config_path)?;
             match action {
                 WtCommands::Add {
@@ -675,7 +685,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 }
 
                 WtCommands::Path { target, repo } => {
-                    let entry = wt_path(&cfg, &target, repo.as_deref())?;
+                    let entry = wt_path(&cfg, &target, repo.as_deref(), json)?;
                     if json {
                         print_json(&entry)?;
                     } else {
@@ -769,14 +779,14 @@ fn dispatch(cli: Cli) -> Result<()> {
                 WtCommands::Hydrate {
                     path,
                     dry_run,
-                    no_post_create,
+                    run_post_create,
                 } => {
                     let report = wt_hydrate(
                         &cfg,
                         &WtHydrateOptions {
                             path,
                             dry_run,
-                            no_post_create,
+                            run_post_create,
                         },
                     )?;
                     if json {

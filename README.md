@@ -198,7 +198,7 @@ caisson config set quotas.soft_disk_limit 400G
 | Command | Purpose |
 | :--- | :--- |
 | `caisson wt add <branch> [--from <ref>] [--name <slug>] [--no-cow] [--force]` | Create a shielded CoW git worktree on `/Volumes/caisson` |
-| `caisson wt hydrate [--dry-run] [--no-post-create]` | Zero-config APFS CoW hydration (`node_modules`/`.venv` or `.caisson.toml`) with lockfile matching |
+| `caisson wt hydrate [--dry-run] [--run-post-create]` | Zero-config clone-only APFS CoW hydration (`node_modules` or `.caisson.toml`) with lockfile ranking |
 | `caisson t3 setup [--volume <name>] [--dry-run]` | Guided T3 Code Worktree location setup (`~/.t3/userdata/settings.json` with backup) |
 | `caisson wt ls [--all]` | List worktrees with idle age, dirty/unpushed flags, and size |
 | `caisson wt path <target>` | Print canonical path of a worktree (powers `wt cd`) |
@@ -251,7 +251,7 @@ During interactive `sudo caisson init`, Caisson detects your installed coding ag
 For host-managed worktree tools like **T3 Code**:
 1. Run `caisson t3 setup --dry-run` (or open **T3 Code -> Settings -> Worktrees -> Worktree location** and point it to `/Volumes/<your-caisson-volume>/t3-worktrees`).
 2. *(Optional, for Node/Python repos)* Open **Project Settings -> Scripts**, add `caisson wt hydrate`, and enable **"Run when creating a worktree"**. No `.caisson.toml` is required for standard `node_modules` / `.venv` repos, and Caisson matches lockfiles (`pnpm-lock.yaml`, `package-lock.json`, `uv.lock`, etc.) automatically so agents know whether they can skip `pnpm install` completely.
-3. Run `sudo caisson daemon install` once; `dev.caisson.mount` uses `RunAtLoad` + `StartOnMount` so shields and `noatime` persist across reboots and external SSD reconnects.
+3. Run `sudo caisson daemon install` once (and re-run it after upgrading `caisson` to refresh the root-owned daemon binary and plist); `dev.caisson.mount` uses `RunAtLoad` + `StartOnMount` so shields and `noatime` persist across reboots and external SSD reconnects.
 
 ---
 

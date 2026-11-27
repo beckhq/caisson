@@ -356,7 +356,7 @@ pub enum WtCommands {
         sync: bool,
     },
 
-    /// Hydrate an existing git worktree (e.g. from T3 Code or `git worktree add`) with `.caisson.toml` CoW clones.
+    /// Hydrate an existing git worktree (e.g. from T3 Code or `git worktree add`) with APFS CoW clones.
     Hydrate {
         /// Path inside the target git worktree (defaults to current working directory).
         #[arg(long)]
@@ -366,9 +366,10 @@ pub enum WtCommands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Skip running the `.caisson.toml` `worktree.post_create` hook.
+        /// Explicitly execute the main repository's `.caisson.toml` `worktree.post_create` hook
+        /// (disabled by default so untrusted branches cannot trigger shell commands during hydration).
         #[arg(long)]
-        no_post_create: bool,
+        run_post_create: bool,
     },
 }
 

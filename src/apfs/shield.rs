@@ -379,7 +379,9 @@ fn ensure_fseventsd_no_log_at(root_fd: &OwnedFd) -> Result<()> {
 
     // Allow unprivileged `stat(".fseventsd/no_log")` via execute/search bit (`0711`) while
     // keeping `.fseventsd` non-listable and root-only writable.
-    let _ = unsafe { libc::fchmod(fs_fd.as_raw_fd(), 0o711) };
+    if unsafe { libc::fchmod(fs_fd.as_raw_fd(), 0o711) } != 0 {
+        return Err(CaissonError::Io(std::io::Error::last_os_error()));
+    }
 
     let c_nolog = CString::new("no_log").unwrap();
     let raw_fd = unsafe {
@@ -582,15 +584,20 @@ pub fn inspect_shields(mount_point: &Path) -> ShieldStatus {
     let metadata_never_index = fs::symlink_metadata(mount_point.join(".metadata_never_index"))
         .map(|m| m.is_file())
         .unwrap_or(false);
-    let fseventsd_is_dir = fs::symlink_metadata(mount_point.join(".fseventsd"))
-        .map(|m| m.is_dir())
+    let fseventsd_meta = fs::symlink_metadata(mount_point.join(".fseventsd")).ok();
+    let fseventsd_is_dir = fseventsd_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+    let fseventsd_root_owned = fseventsd_meta
+        .as_ref()
+        .map(|m| std::os::unix::fs::MetadataExt::uid(m) == 0)
         .unwrap_or(false);
     let (fseventsd_no_log, fseventsd_no_log_unverified) = if !fseventsd_is_dir {
         (false, false)
     } else {
         match fs::symlink_metadata(mount_point.join(".fseventsd").join("no_log")) {
             Ok(m) => (m.is_file(), false),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (false, true),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && fseventsd_root_owned => {
+                (false, true)
+            }
             Err(_) => (false, false),
         }
     };
@@ -764,7 +771,8 @@ mod tests {
         assert!(!after.fseventsd_no_log_unverified);
         assert!(after.trashes_blocked);
 
-        // Simulate macOS's root-only 0700 `.fseventsd` (untraversable by non-root -> PermissionDenied).
+        // A non-root-owned unreadable `.fseventsd` directory must NOT be falsely classified as
+        // macOS's root-only `fseventsd_no_log_unverified` state.
         let locked_dir = tempdir().unwrap();
         let fs_dir = locked_dir.path().join(".fseventsd");
         fs::create_dir_all(&fs_dir).unwrap();
@@ -776,7 +784,7 @@ mod tests {
         let _ = fs::set_permissions(&fs_dir, fs::Permissions::from_mode(0o755));
         if !crate::apfs::statfs::is_root() {
             assert!(!locked_status.fseventsd_no_log);
-            assert!(locked_status.fseventsd_no_log_unverified);
+            assert!(!locked_status.fseventsd_no_log_unverified);
         }
     }
 }

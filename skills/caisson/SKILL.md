@@ -10,19 +10,19 @@ description: Use Caisson on macOS when you would otherwise run `git worktree add
 - Use `caisson wt` when **you** would otherwise invoke `git worktree add` / `list` / `remove` directly on macOS.
 - **Do not route around host-managed worktrees.** If your host environment creates or binds a worktree for the thread (such as T3 Code `workspaceStrategy`, Claude Code worktree isolation, or an IDE worktree manager), let the host manage worktree creation and use `caisson wt hydrate` inside it.
 
-## Touchless Dependency Hydration in Fresh Worktrees (JS/TS & Python)
+## Touchless Dependency Hydration in Fresh Worktrees (JS/TS)
 
-Whenever you enter a git worktree on macOS and `node_modules/` or `.venv/` is missing, **run `caisson wt hydrate --json` BEFORE running `pnpm install`, `npm ci`, `bun install`, or `uv sync`**:
+Whenever you enter a git worktree on macOS and `node_modules/` is missing, **run `caisson wt hydrate --json` BEFORE running `pnpm install`, `npm ci`, or `bun install`**:
 
 ```bash
 caisson wt hydrate --json
 ```
 
-`caisson wt hydrate` is zero-`sudo`, idempotent, touches only the current worktree, and works even when `.caisson.toml` is absent (auto-detecting `node_modules` for `package.json` and `.venv` for `pyproject.toml`/`requirements.txt`, never build output directories).
+`caisson wt hydrate` is zero-`sudo`, idempotent, clone-only by default (does not execute `post_create` hooks unless `--run-post-create` is passed), touches only the current worktree, and auto-detects `node_modules` for `package.json` repos even when `.caisson.toml` is absent.
 
-Handle its JSON output deterministically:
-- **`status: "cloned"` and `lockfile_match: true`:** Dependencies are an exact APFS CoW clone of a matching sibling worktree. **Skip the package-manager install completely.**
-- **`status: "cloned"` and `lockfile_match: false`:** 99% of packages are already cloned; run a fast incremental install (e.g. `pnpm install --offline` or `pnpm install`) to reconcile only the lockfile diff.
+Handle its JSON output carefully:
+- **`status: "cloned"` and `lockfile_match: true`:** Dependencies were APFS CoW-cloned from a sibling whose lockfile matches byte-for-byte. Run a quick offline verify (e.g. `pnpm install --offline --frozen-lockfile --ignore-scripts`) or proceed directly to tests and fall back to install if any package is missing from a partial donor.
+- **`status: "cloned"` and `lockfile_match: false`:** Most packages are already cloned; run a fast incremental install (e.g. `pnpm install`) to reconcile only the lockfile diff.
 - **`status: "skipped"`:** No same-volume donor exists yet (e.g. first worktree on this volume). Fall back to normal package install.
 
 ## One-Time Proactive Setup Offer (Low-Noise)

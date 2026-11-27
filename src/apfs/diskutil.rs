@@ -570,8 +570,32 @@ pub fn is_custom_mount_point(name: &str, mount_point: &Path) -> bool {
     mount_point != default_mp.as_path()
 }
 
-/// Validate that a custom mount point directory is safe to mount over (absolute, non-system,
-/// non-symlink, and empty if it already exists). Optionally creates the directory if missing.
+fn is_protected_mount_target(path: &Path) -> bool {
+    let mp_str = path.to_string_lossy();
+    let trimmed = mp_str.trim_end_matches('/');
+    trimmed.is_empty()
+        || trimmed == "/System"
+        || trimmed.starts_with("/System/")
+        || matches!(
+            trimmed,
+            "/Volumes"
+                | "/Applications"
+                | "/Library"
+                | "/Users"
+                | "/bin"
+                | "/sbin"
+                | "/usr"
+                | "/private"
+                | "/private/var"
+                | "/private/etc"
+                | "/etc"
+                | "/var"
+        )
+}
+
+/// Validate that a custom mount point directory is safe to mount over (absolute, non-system
+/// even after resolving ancestor aliases, non-symlink leaf, and empty if it already exists).
+/// Optionally creates the directory if missing.
 pub fn validate_safe_custom_mount_dir(mount_point: &Path, create_if_missing: bool) -> Result<()> {
     if !mount_point.is_absolute() {
         return Err(CaissonError::Message(format!(
@@ -579,20 +603,48 @@ pub fn validate_safe_custom_mount_dir(mount_point: &Path, create_if_missing: boo
             mount_point.display()
         )));
     }
-    let mp_str = mount_point.to_string_lossy();
-    let trimmed = mp_str.trim_end_matches('/');
-    if trimmed.is_empty()
-        || trimmed == "/System"
-        || trimmed.starts_with("/System/")
-        || matches!(
-            trimmed,
-            "/Volumes" | "/Applications" | "/Library" | "/Users" | "/bin" | "/sbin" | "/usr"
-        )
+    if mount_point
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
     {
+        return Err(CaissonError::Message(format!(
+            "custom mount point '{}' must not contain `..` path traversal components",
+            mount_point.display()
+        )));
+    }
+    if is_protected_mount_target(mount_point) {
         return Err(CaissonError::Message(format!(
             "refusing to use protected system directory '{}' as a custom mount point",
             mount_point.display()
         )));
+    }
+
+    // Walk up to the nearest existing ancestor and verify its canonical resolved target
+    // does not alias onto a protected system root (e.g. `/var/..` or symlink to `/System`).
+    let mut existing = mount_point.to_path_buf();
+    let mut missing_tail = Vec::new();
+    while !existing.exists() && std::fs::symlink_metadata(&existing).is_err() {
+        let Some(name) = existing.file_name() else {
+            break;
+        };
+        missing_tail.push(name.to_os_string());
+        if !existing.pop() {
+            break;
+        }
+    }
+    if existing.exists() {
+        let resolved_base = std::fs::canonicalize(&existing)?;
+        let mut resolved_full = resolved_base;
+        for seg in missing_tail.iter().rev() {
+            resolved_full.push(seg);
+        }
+        if is_protected_mount_target(&resolved_full) {
+            return Err(CaissonError::Message(format!(
+                "refusing to use protected system target '{}' (resolved from '{}') as a custom mount point",
+                resolved_full.display(),
+                mount_point.display()
+            )));
+        }
     }
 
     match std::fs::symlink_metadata(mount_point) {

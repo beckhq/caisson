@@ -62,7 +62,8 @@ impl MountAllReport {
 }
 
 /// Generate the auditable one-shot LaunchDaemon plist XML (`ARCHITECTURE.md` §4).
-/// `RunAtLoad = true`, `KeepAlive = false`: runs `caisson mount-all` once at boot and exits.
+/// `RunAtLoad = true`, `StartOnMount = true`, `ThrottleInterval = 5`, `KeepAlive = false`:
+/// runs `caisson mount-all` once at boot and whenever an external volume mounts, then exits.
 pub fn generate_plist_xml(caisson_bin: &Path) -> Result<String> {
     let mut dict = Dictionary::new();
     dict.insert(
@@ -551,16 +552,51 @@ pub fn mount_all(registry_path: &Path, dry_run: bool) -> Result<MountAllReport> 
                             });
                             continue;
                         }
+                        if let Err(e) = validate_safe_custom_mount_dir(&expected_mp, true) {
+                            let _ = execute_mount_volume(&vol.uuid, None);
+                            results.push(MountAllVolumeResult {
+                                name: vol.name.clone(),
+                                uuid: vol.uuid.clone(),
+                                mount_point: vol.mount_point.clone(),
+                                mounted_action: "custom-mountpoint-unsafe".to_string(),
+                                shield_report: None,
+                                error: Some(e.to_string()),
+                            });
+                            continue;
+                        }
                         match execute_mount_volume(&vol.uuid, Some(&expected_mp)) {
                             Ok(_) => {
-                                mounted_action = "remounted-custom".to_string();
                                 match diskutil_info(&vol.uuid)
                                     .ok()
                                     .and_then(|info| info.mount_point)
                                     .filter(|s| !s.trim().is_empty())
                                 {
-                                    Some(remounted) => PathBuf::from(remounted),
+                                    Some(remounted) => {
+                                        let remounted_path = PathBuf::from(&remounted);
+                                        let canon_remounted = fs::canonicalize(&remounted_path)
+                                            .unwrap_or_else(|_| remounted_path.clone());
+                                        let canon_target = fs::canonicalize(&expected_mp)
+                                            .unwrap_or_else(|_| expected_mp.clone());
+                                        if canon_remounted != canon_target {
+                                            results.push(MountAllVolumeResult {
+                                                name: vol.name.clone(),
+                                                uuid: vol.uuid.clone(),
+                                                mount_point: remounted,
+                                                mounted_action: "mount-mismatch".to_string(),
+                                                shield_report: None,
+                                                error: Some(format!(
+                                                    "expected custom mount at '{}', but diskutil mounted at '{}'",
+                                                    canon_target.display(),
+                                                    canon_remounted.display()
+                                                )),
+                                            });
+                                            continue;
+                                        }
+                                        mounted_action = "remounted-custom".to_string();
+                                        remounted_path
+                                    }
                                     None => {
+                                        let _ = execute_mount_volume(&vol.uuid, None);
                                         results.push(MountAllVolumeResult {
                                             name: vol.name.clone(),
                                             uuid: vol.uuid.clone(),
@@ -577,6 +613,8 @@ pub fn mount_all(registry_path: &Path, dry_run: bool) -> Result<MountAllReport> 
                                 }
                             }
                             Err(e) => {
+                                // Restore default mount so a failed custom remount does not strand the volume offline.
+                                let _ = execute_mount_volume(&vol.uuid, None);
                                 results.push(MountAllVolumeResult {
                                     name: vol.name.clone(),
                                     uuid: vol.uuid.clone(),

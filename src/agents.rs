@@ -1,4 +1,3 @@
-use crate::apfs::statfs::invoking_user;
 use crate::config::CaissonConfig;
 use crate::error::{CaissonError, Result};
 use serde::Serialize;
@@ -6,7 +5,6 @@ use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Embedded canonical `SKILL.md` so `caisson agent install` works completely offline.
 pub const CAISSON_SKILL_MD: &str = include_str!("../skills/caisson/SKILL.md");
@@ -223,14 +221,75 @@ fn detect_agent(home: &Path, spec: &AgentSpec) -> bool {
     false
 }
 
+/// Exact FNV-1a hashes of previously shipped Caisson `SKILL.md` releases (`v0.1.1`-`v0.1.5`)
+/// so legacy installs without `agents.skill_hashes` auto-migrate only when unmodified.
+const KNOWN_LEGACY_SKILL_HASHES: &[&str] = &[
+    "a2c66fc513635f0b", // v0.1.1 - v0.1.2
+    "e39cf0efa466113c", // v0.1.3
+    "76fa4582e6b7cfb9", // v0.1.4 - v0.1.5
+];
+
+/// Ensure no existing path component from `home` down through `rel` is a symlink.
+fn ensure_no_symlink_components_under(home: &Path, rel: &str) -> Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(home) {
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(CaissonError::Message(format!(
+                "refusing to operate through symlinked home directory '{}'",
+                home.display()
+            )));
+        }
+    }
+    let mut cur = home.to_path_buf();
+    for comp in Path::new(rel).components() {
+        cur.push(comp);
+        if let Ok(meta) = fs::symlink_metadata(&cur) {
+            if meta.file_type().is_symlink() {
+                return Err(CaissonError::Message(format!(
+                    "refusing to follow symlink component '{}'",
+                    cur.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Atomically write `content` to `dest` without following symlinks at `dest`.
+fn atomic_write_skill_file(dest: &Path, content: &str) -> Result<()> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| CaissonError::Message(format!("invalid skill path '{}'", dest.display())))?;
+    let tmp_name = format!(".SKILL.md.caisson.{}.tmp", uuid::Uuid::new_v4());
+    let tmp_path = parent.join(tmp_name);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    if let Err(e) = fs::rename(&tmp_path, dest) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(CaissonError::Io(e));
+    }
+    Ok(())
+}
+
 /// Determine `(up_to_date, customized)` for an existing on-disk `SKILL.md`.
 fn classify_installed_skill(
     spec_id: &str,
     skill_path: &Path,
     config: &CaissonConfig,
 ) -> (bool, bool) {
+    let Ok(meta) = fs::symlink_metadata(skill_path) else {
+        return (false, true);
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return (false, true);
+    }
     let Ok(disk_content) = fs::read_to_string(skill_path) else {
-        return (false, false);
+        // Never overwrite unreadable or non-UTF-8 files automatically.
+        return (false, true);
     };
     let current_hash = skill_content_hash(CAISSON_SKILL_MD);
     let disk_hash = skill_content_hash(&disk_content);
@@ -244,16 +303,9 @@ fn classify_installed_skill(
         return (false, disk_hash != *recorded_hash);
     }
 
-    // Backwards-compatible migration for v0.1.0-v0.1.4 installs before `skill_hashes` existed:
-    // if the agent is listed in `config.agents.installed` and starts with Caisson's YAML header,
-    // treat it as an unmodified Caisson-managed skill eligible for seamless auto-update.
-    let was_managed = config
-        .agents
-        .installed
-        .iter()
-        .any(|id| id.eq_ignore_ascii_case(spec_id));
-    let has_caisson_header = disk_content.starts_with("---\nname: caisson\n");
-    if was_managed && has_caisson_header {
+    // Backwards-compatible migration for v0.1.1-v0.1.4 installs before `skill_hashes` existed:
+    // only auto-migrate if the on-disk file matches an exact shipped Caisson SKILL.md hash.
+    if KNOWN_LEGACY_SKILL_HASHES.contains(&disk_hash.as_str()) {
         (false, false)
     } else {
         (false, true)
@@ -295,9 +347,7 @@ pub fn inspect_agents(home: &Path, config: &CaissonConfig) -> Vec<AgentHarnessSt
 }
 
 /// Install `SKILL.md` for the requested agents (or all detected agents if `targets` is empty).
-/// When executed under `sudo` (e.g. during `sudo caisson init`), hands ownership of created
-/// skill directories and files back to the invoking developer so root-owned files are never
-/// left inside `$HOME`.
+/// Refuses to write into `$HOME` when running as root (`sudo`) to avoid privileged symlink risks.
 pub fn install_agent_skills(
     home: &Path,
     config: &mut CaissonConfig,
@@ -305,6 +355,12 @@ pub fn install_agent_skills(
     all_detected: bool,
     dry_run: bool,
 ) -> Result<AgentActionReport> {
+    if !dry_run && crate::apfs::statfs::is_root() {
+        return Err(CaissonError::Message(
+            "refusing to write agent skills into `$HOME` as root; run `caisson agent install` without `sudo`".to_string(),
+        ));
+    }
+
     let specs: Vec<&AgentSpec> = if !targets.is_empty() {
         let mut list = Vec::with_capacity(targets.len());
         for t in targets {
@@ -330,23 +386,16 @@ pub fn install_agent_skills(
             .collect()
     };
 
-    let owner = if crate::apfs::statfs::is_root() {
-        invoking_user()
-    } else {
-        None
-    };
-
     let current_hash = skill_content_hash(CAISSON_SKILL_MD);
     let mut affected = Vec::new();
     for spec in specs {
         let skill_path = home.join(spec.skill_rel);
+        ensure_no_symlink_components_under(home, spec.skill_rel)?;
         if !dry_run {
             if let Some(parent) = skill_path.parent() {
                 fs::create_dir_all(parent)?;
-                fs::write(&skill_path, CAISSON_SKILL_MD)?;
-                if let Some(ref user) = owner {
-                    chown_skill_tree(home, spec, user);
-                }
+                ensure_no_symlink_components_under(home, spec.skill_rel)?;
+                atomic_write_skill_file(&skill_path, CAISSON_SKILL_MD)?;
             }
             if !config
                 .agents
@@ -392,25 +441,6 @@ pub fn install_agent_skills(
     })
 }
 
-fn chown_skill_tree(home: &Path, spec: &AgentSpec, user: &str) {
-    let ownership = format!("{user}:staff");
-    let detect_dir = home.join(spec.detect_rel);
-    let skill_file = home.join(spec.skill_rel);
-    let mut cur = skill_file.as_path();
-    while cur != home {
-        let _ = Command::new("chown")
-            .args([&ownership, &cur.display().to_string()])
-            .output();
-        if cur == detect_dir {
-            break;
-        }
-        match cur.parent() {
-            Some(p) => cur = p,
-            None => break,
-        }
-    }
-}
-
 /// Remove `SKILL.md` for the specified agent targets (or all installed if `all` is true).
 pub fn uninstall_agent_skills(
     home: &Path,
@@ -419,6 +449,12 @@ pub fn uninstall_agent_skills(
     all: bool,
     dry_run: bool,
 ) -> Result<AgentActionReport> {
+    if !dry_run && crate::apfs::statfs::is_root() {
+        return Err(CaissonError::Message(
+            "refusing to modify `$HOME` agent skills as root; run `caisson agent uninstall` without `sudo`".to_string(),
+        ));
+    }
+
     let specs: Vec<&AgentSpec> = if all {
         KNOWN_AGENTS
             .iter()
@@ -439,8 +475,9 @@ pub fn uninstall_agent_skills(
     let mut affected = Vec::new();
     for spec in specs {
         let skill_path = home.join(spec.skill_rel);
+        ensure_no_symlink_components_under(home, spec.skill_rel)?;
         if !dry_run {
-            if skill_path.exists() {
+            if fs::symlink_metadata(&skill_path).is_ok() {
                 fs::remove_file(&skill_path)?;
             }
             if let Some(parent) = skill_path.parent() {
@@ -601,6 +638,17 @@ pub fn prompt_interactive_agent_setup(
         return Ok(None);
     }
 
+    // Never write into `$HOME` when running as root (e.g. `sudo caisson init`).
+    if crate::apfs::statfs::is_root() {
+        let ids: Vec<&str> = pending.iter().map(|a| a.id.as_str()).collect();
+        println!(
+            "\nDetected coding agents without the Caisson skill: {}.",
+            ids.join(", ")
+        );
+        println!("Run `caisson agent install` (without sudo) to install the skill.");
+        return Ok(None);
+    }
+
     let ids: Vec<String> = pending.iter().map(|a| a.id.clone()).collect();
     println!("\nDetected coding agents without the Caisson skill:");
     for a in &pending {
@@ -639,41 +687,27 @@ pub fn prompt_interactive_agent_setup(
         Some(install_agent_skills(home, config, &chosen, false, false)?)
     };
 
-    // Persist config cleanly (handing ownership back to invoking user if run via sudo).
     let _ = config.save_to(config_path);
-    if crate::apfs::statfs::is_root() {
-        if let Some(user) = invoking_user() {
-            let spec = format!("{user}:staff");
-            let _ = Command::new("chown")
-                .args([&spec, &config_path.display().to_string()])
-                .output();
-            if let Some(parent) = config_path.parent() {
-                let _ = Command::new("chown")
-                    .args([&spec, &parent.display().to_string()])
-                    .output();
-            }
-        }
-    }
-
     Ok(report)
 }
 
 /// Refresh all already-installed Caisson agent skills from this binary's embedded `SKILL.md`.
 ///
-/// Never installs skills for agents the user did not opt into, refuses to overwrite symlinks,
-/// and preserves hand-edited user skills unless `force` is true.
+/// Never installs skills for agents the user did not opt into, refuses to run as root or
+/// overwrite symlinks, and preserves hand-edited user skills unless `force` is true.
 pub fn sync_installed_agent_skills(
     home: &Path,
     config: &mut CaissonConfig,
     force: bool,
     dry_run: bool,
 ) -> Result<AgentSyncReport> {
+    if !dry_run && crate::apfs::statfs::is_root() {
+        return Err(CaissonError::Message(
+            "refusing to update `$HOME` agent skills as root; run `caisson agent update` without `sudo`".to_string(),
+        ));
+    }
+
     let current_hash = skill_content_hash(CAISSON_SKILL_MD);
-    let owner = if crate::apfs::statfs::is_root() {
-        invoking_user()
-    } else {
-        None
-    };
 
     let mut updated = Vec::new();
     let mut skipped_customized = Vec::new();
@@ -681,6 +715,9 @@ pub fn sync_installed_agent_skills(
 
     for spec in KNOWN_AGENTS {
         let skill_path = home.join(spec.skill_rel);
+        if ensure_no_symlink_components_under(home, spec.skill_rel).is_err() {
+            continue;
+        }
         let Ok(meta) = fs::symlink_metadata(&skill_path) else {
             continue;
         };
@@ -723,10 +760,7 @@ pub fn sync_installed_agent_skills(
         }
 
         if !dry_run {
-            fs::write(&skill_path, CAISSON_SKILL_MD)?;
-            if let Some(ref user) = owner {
-                chown_skill_tree(home, spec, user);
-            }
+            atomic_write_skill_file(&skill_path, CAISSON_SKILL_MD)?;
             if !config
                 .agents
                 .installed
@@ -970,6 +1004,44 @@ mod tests {
         assert_eq!(
             fs::read_to_string(home.join(".codex/skills/caisson/SKILL.md")).unwrap(),
             CAISSON_SKILL_MD
+        );
+    }
+
+    #[test]
+    fn rejects_symlinked_skill_paths_and_preserves_unreadable_skills() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let outside = tempdir().unwrap();
+        symlink(outside.path(), home.join(".claude")).unwrap();
+
+        let mut cfg = CaissonConfig::default();
+        let err = install_agent_skills(home, &mut cfg, &["claude".to_string()], false, false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got: {}",
+            err
+        );
+        assert!(!outside.path().join("skills/caisson/SKILL.md").exists());
+
+        // Non-UTF8 skill file must be treated as customized and never silently overwritten by sync.
+        let codex_skill = home.join(".codex/skills/caisson/SKILL.md");
+        fs::create_dir_all(codex_skill.parent().unwrap()).unwrap();
+        fs::write(&codex_skill, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let inspected = inspect_agents(home, &cfg);
+        let codex = inspected.iter().find(|a| a.id == "codex").unwrap();
+        assert!(codex.installed);
+        assert!(codex.customized);
+        assert!(!codex.up_to_date);
+
+        let sync = sync_installed_agent_skills(home, &mut cfg, false, false).unwrap();
+        assert_eq!(sync.updated.len(), 0);
+        assert_eq!(sync.skipped_customized.len(), 1);
+        assert_eq!(
+            fs::read(&codex_skill).unwrap(),
+            vec![0xff, 0xfe, 0x00, 0x01]
         );
     }
 }

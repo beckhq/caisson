@@ -1,7 +1,7 @@
 use crate::apfs::diskutil::{
     build_add_volume_args, compute_auto_quota, detect_internal_container, diskutil_info,
-    execute_add_volume, execute_delete_volume, is_custom_mount_point, is_external_container,
-    list_apfs, resolve_container_for_path, validate_safe_custom_mount_dir, validate_volume_name,
+    execute_add_volume, execute_delete_volume, is_external_container, list_apfs,
+    resolve_container_for_path, validate_safe_custom_mount_dir, validate_volume_name,
     verify_destroy_safety, ApfsContainer,
 };
 use crate::apfs::shield::{
@@ -194,10 +194,8 @@ pub fn create_volume(
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("/Volumes/{}", opts.name)));
 
-    if let Some(ref custom_mp) = opts.mount_point {
-        if is_custom_mount_point(&opts.name, custom_mp) {
-            validate_safe_custom_mount_dir(custom_mp, false)?;
-        }
+    if let Some(ref explicit_mp) = opts.mount_point {
+        validate_safe_custom_mount_dir(explicit_mp, false)?;
     }
 
     let args = build_add_volume_args(
@@ -257,16 +255,14 @@ pub fn create_volume(
         });
     }
 
-    if let Some(ref custom_mp) = opts.mount_point {
-        if is_custom_mount_point(&opts.name, custom_mp) {
-            let existed = custom_mp.exists();
-            validate_safe_custom_mount_dir(custom_mp, true)?;
-            if !existed {
-                if let Some(ref user) = owner {
-                    let _ = Command::new("chown")
-                        .args([&format!("{user}:staff"), &custom_mp.display().to_string()])
-                        .output();
-                }
+    if let Some(ref explicit_mp) = opts.mount_point {
+        let existed = explicit_mp.exists();
+        validate_safe_custom_mount_dir(explicit_mp, true)?;
+        if !existed {
+            if let Some(ref user) = owner {
+                let _ = Command::new("chown")
+                    .args([&format!("{user}:staff"), &explicit_mp.display().to_string()])
+                    .output();
             }
         }
     }

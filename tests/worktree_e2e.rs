@@ -797,12 +797,12 @@ post_create = "echo hydrated:$CAISSON_BRANCH > .hook-ran"
     assert!(!wt_new.join("node_modules").exists());
     assert!(!wt_new.join(".hook-ran").exists());
 
-    // 2. Real hydrate with `--no-post-create` clones both entries and skips hook.
+    // 2. Default `wt hydrate` is clone-only (does NOT execute `post_create` unless `--run-post-create`).
     let hyd1 = run_caisson(
         &wt_new,
         &caisson_root,
         &config_path,
-        &["wt", "hydrate", "--no-post-create", "--json"],
+        &["wt", "hydrate", "--json"],
     );
     assert!(
         hyd1.status.success(),
@@ -822,12 +822,12 @@ post_create = "echo hydrated:$CAISSON_BRANCH > .hook-ran"
         "v1-sibling\n"
     );
 
-    // 3. Re-running `wt hydrate` is idempotent (skips existing dirs) and runs `post_create`.
+    // 3. Re-running `wt hydrate --run-post-create` is idempotent on clones and runs main repo's hook.
     let hyd2 = run_caisson(
         &wt_new,
         &caisson_root,
         &config_path,
-        &["wt", "hydrate", "--json"],
+        &["wt", "hydrate", "--run-post-create", "--json"],
     );
     assert!(hyd2.status.success());
     let hyd2_json: Value = serde_json::from_slice(&hyd2.stdout).unwrap();
@@ -949,4 +949,92 @@ fn wt_hydrate_zero_config_auto_detects_and_prefers_matching_lockfile_donor() {
     let json3: Value = serde_json::from_slice(&out3.stdout).unwrap();
     assert_eq!(json3["cow_clones"][0]["status"], "cloned");
     assert_eq!(json3["cow_clones"][0]["lockfile_match"], false);
+}
+
+#[test]
+fn wt_hydrate_never_runs_untrusted_branch_post_create_and_rm_respects_tier_precedence() {
+    let sandbox = tempdir().unwrap();
+    let repo_dir = sandbox.path().join("sec-repo");
+    let caisson_root = sandbox.path().join("mock-caisson-vol");
+    let config_path = sandbox.path().join("config.toml");
+    fs::create_dir_all(&caisson_root).unwrap();
+    init_sample_repo(&repo_dir);
+
+    // 1. Untrusted branch modifies `.caisson.toml` with a malicious `post_create` hook.
+    // Even with `--run-post-create`, `wt hydrate` MUST read `post_create` strictly from the
+    // main repo checkout (which has no `post_create`), never from the target branch.
+    let untrusted_wt = sandbox.path().join("untrusted-branch-wt");
+    run_git(
+        &repo_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "pr/untrusted",
+            untrusted_wt.to_str().unwrap(),
+        ],
+    );
+    fs::write(
+        untrusted_wt.join(".caisson.toml"),
+        "[worktree]\ncow_copy = [\"node_modules\"]\npost_create = \"echo pwned > .pwned\"\n",
+    )
+    .unwrap();
+    let hyd = run_caisson(
+        &untrusted_wt,
+        &caisson_root,
+        &config_path,
+        &["wt", "hydrate", "--run-post-create", "--json"],
+    );
+    assert!(
+        hyd.status.success(),
+        "hydrate failed: {}",
+        String::from_utf8_lossy(&hyd.stderr)
+    );
+    let hyd_json: Value = serde_json::from_slice(&hyd.stdout).unwrap();
+    assert_eq!(hyd_json["post_create_ran"], false);
+    assert!(!untrusted_wt.join(".pwned").exists());
+
+    // 2. Deterministic tier precedence for `wt path` / `wt rm`:
+    // Worktree A has branch `feat/alpha` and slug `feat-alpha`.
+    // Worktree B has branch `feat-alpha` and custom slug `custom-b`.
+    // Target `feat-alpha` must deterministically select exact slug (Tier 2) over exact branch (Tier 3),
+    // and `wt path --json` must populate real git/disk metadata (not fabricated zeros/falses).
+    let add_a = run_caisson(
+        &repo_dir,
+        &caisson_root,
+        &config_path,
+        &["wt", "add", "feat/alpha", "--json"],
+    );
+    assert!(add_a.status.success());
+    let add_b = run_caisson(
+        &repo_dir,
+        &caisson_root,
+        &config_path,
+        &["wt", "add", "feat-alpha", "--name", "custom-b", "--json"],
+    );
+    assert!(
+        add_b.status.success(),
+        "add_b failed: {}",
+        String::from_utf8_lossy(&add_b.stderr)
+    );
+
+    // Modify a tracked file inside `feat/alpha` so `dirty` is true on disk.
+    let a_json: Value = serde_json::from_slice(&add_a.stdout).unwrap();
+    let a_path = PathBuf::from(a_json["path"].as_str().unwrap());
+    fs::write(a_path.join("README.md"), "dirty-change\n").unwrap();
+
+    // `wt path feat-alpha --json` must deterministically pick slug `feat-alpha` (branch `feat/alpha`)
+    // and report live `dirty: true` + nonzero `disk_bytes`.
+    let path_out = run_caisson(
+        &repo_dir,
+        &caisson_root,
+        &config_path,
+        &["wt", "path", "feat-alpha", "--json"],
+    );
+    assert!(path_out.status.success());
+    let path_json: Value = serde_json::from_slice(&path_out.stdout).unwrap();
+    assert_eq!(path_json["slug"], "feat-alpha");
+    assert_eq!(path_json["branch"], "feat/alpha");
+    assert_eq!(path_json["dirty"], true);
+    assert!(path_json["disk_bytes"].as_u64().unwrap() > 0);
 }

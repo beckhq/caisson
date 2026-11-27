@@ -1,10 +1,10 @@
 use crate::apfs::shield::inspect_shields;
 use crate::apfs::statfs::{same_volume, statfs_path};
-use crate::apfs::volume::list_registered_volumes;
+use crate::apfs::volume::{list_registered_volumes, verify_mount_root_matches_uuid};
 use crate::error::{CaissonError, Result};
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -101,22 +101,49 @@ pub fn format_t3_next_steps(recommended_dir: &Path) -> String {
     )
 }
 
+/// Verify that `~/.t3`, `~/.t3/userdata`, and `~/.t3/userdata/settings.json` are not symlinks.
+fn verify_safe_t3_settings_path(home: &Path) -> Result<PathBuf> {
+    let mut cur = home.to_path_buf();
+    for seg in [".t3", "userdata", "settings.json"] {
+        cur.push(seg);
+        let meta = fs::symlink_metadata(&cur).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                CaissonError::Message(format!(
+                    "T3 Code settings file not found at '{}'. Open T3 Code once first.",
+                    t3_settings_path(home).display()
+                ))
+            } else {
+                CaissonError::Io(e)
+            }
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(CaissonError::Message(format!(
+                "refusing to modify T3 Code settings through symlink '{}'",
+                cur.display()
+            )));
+        }
+        if seg == "settings.json" && !meta.is_file() {
+            return Err(CaissonError::Message(format!(
+                "'{}' is not a regular file",
+                cur.display()
+            )));
+        }
+    }
+    Ok(cur)
+}
+
 /// Guided, zero-sudo setup that previews or updates T3 Code's `worktreesDirectory` in
-/// `~/.t3/userdata/settings.json` with an automatic backup and atomic write.
+/// `~/.t3/userdata/settings.json` with an automatic backup, concurrent-edit guard, and atomic write.
 pub fn run_t3_setup(
     home: &Path,
     registry_path: &Path,
     opts: &T3SetupOptions,
 ) -> Result<T3SetupReport> {
-    let settings_path = t3_settings_path(home);
-    if !settings_path.is_file() {
-        return Err(CaissonError::Message(format!(
-            "T3 Code settings file not found at '{}'. Open T3 Code once first, or pass `--path` after creating it.",
-            settings_path.display()
-        )));
-    }
+    let settings_path = verify_safe_t3_settings_path(home)?;
 
     let registered = list_registered_volumes(registry_path).unwrap_or_default();
+    let mut verified_named_volume: Option<(PathBuf, String)> = None;
+
     let target_dir = if let Some(ref explicit_path) = opts.path {
         explicit_path.clone()
     } else if let Some(ref vol_name) = opts.volume {
@@ -128,7 +155,16 @@ pub fn run_t3_setup(
                     "Caisson volume '{vol_name}' not found in registry (run `caisson vol ls`)"
                 ))
             })?;
-        PathBuf::from(&found.mount_point).join("t3-worktrees")
+        if !found.mounted {
+            return Err(CaissonError::Message(format!(
+                "Caisson volume '{}' ({}) is currently offline/unmounted; mount or reconnect it first so Caisson does not create directories on `/`",
+                found.name, found.mount_point
+            )));
+        }
+        let mp = PathBuf::from(&found.mount_point);
+        verify_mount_root_matches_uuid(&mp, &found.uuid)?;
+        verified_named_volume = Some((mp.clone(), found.uuid.clone()));
+        mp.join("t3-worktrees")
     } else {
         let healthy_mounts: Vec<&str> = registered
             .iter()
@@ -140,7 +176,16 @@ pub fn run_t3_setup(
                 "No mounted, healthy Caisson APFS volume found. Run `sudo caisson init` (or `sudo caisson vol create <name> --on /Volumes/<ssd>`) first.".to_string(),
             ));
         }
-        recommend_t3_worktrees_path(&healthy_mounts)
+        let chosen = recommend_t3_worktrees_path(&healthy_mounts);
+        if let Some(vol) = registered
+            .iter()
+            .find(|v| v.mounted && chosen.starts_with(Path::new(&v.mount_point)))
+        {
+            let mp = PathBuf::from(&vol.mount_point);
+            verify_mount_root_matches_uuid(&mp, &vol.uuid)?;
+            verified_named_volume = Some((mp, vol.uuid.clone()));
+        }
+        chosen
     };
 
     if !target_dir.is_absolute() {
@@ -205,20 +250,53 @@ pub fn run_t3_setup(
         confirm_t3_settings_update(&settings_path, previous.as_deref(), &target_str)?;
     }
 
-    // Ensure the target directory exists on the Caisson volume.
+    // Re-verify live volume identity and settings snapshot after confirmation to prevent races.
+    if let Some((ref mp, ref expected_uuid)) = verified_named_volume {
+        verify_mount_root_matches_uuid(mp, expected_uuid)?;
+    }
+    let _ = verify_safe_t3_settings_path(home)?;
+    let current_raw = fs::read_to_string(&settings_path)?;
+    if current_raw != raw {
+        return Err(CaissonError::Message(format!(
+            "'{}' changed while awaiting confirmation; re-run `caisson t3 setup` so concurrent T3 Code edits are not lost",
+            settings_path.display()
+        )));
+    }
+
+    // Ensure the target directory exists on the verified volume.
     fs::create_dir_all(&target_dir)?;
 
-    // Backup existing settings before atomic update.
-    let backup_path = settings_path.with_file_name("settings.json.caisson.bak");
-    fs::write(&backup_path, &raw)?;
+    // Exclusive, symlink-safe backup file and atomic temporary replacement file.
+    let backup_path = settings_path.with_file_name(format!(
+        "settings.json.caisson.{}.bak",
+        uuid::Uuid::new_v4()
+    ));
+    let mut bak_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&backup_path)?;
+    bak_file.write_all(raw.as_bytes())?;
+    bak_file.sync_all()?;
+    drop(bak_file);
 
     update_worktrees_directory_key(obj, &target_str);
     let serialized = serde_json::to_string_pretty(&json_val)?;
 
-    let tmp_path =
-        settings_path.with_file_name(format!("settings.json.caisson.{}.tmp", std::process::id()));
-    fs::write(&tmp_path, format!("{serialized}\n"))?;
-    fs::rename(&tmp_path, &settings_path)?;
+    let tmp_path = settings_path.with_file_name(format!(
+        ".settings.json.caisson.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let mut tmp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    tmp_file.write_all(format!("{serialized}\n").as_bytes())?;
+    tmp_file.sync_all()?;
+    drop(tmp_file);
+    if let Err(e) = fs::rename(&tmp_path, &settings_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(CaissonError::Io(e));
+    }
 
     Ok(T3SetupReport {
         settings_path: settings_path.display().to_string(),

@@ -122,7 +122,7 @@ pub struct GcReport {
 pub struct WtHydrateOptions {
     pub path: Option<PathBuf>,
     pub dry_run: bool,
-    pub no_post_create: bool,
+    pub run_post_create: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -605,42 +605,89 @@ fn lockfiles_for_entry(entry: &str) -> &'static [&'static str] {
     }
 }
 
+/// Bounded, non-blocking, symlink-rejecting read of a regular file (max 16 MiB).
+fn read_regular_file_nofollow_bounded(path: &Path) -> Option<Vec<u8>> {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    const MAX_LOCKFILE_BYTES: u64 = 16 * 1024 * 1024;
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let raw_fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if raw_fd < 0 {
+        return None;
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return None;
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG || (st.st_size as u64) > MAX_LOCKFILE_BYTES {
+        return None;
+    }
+    let file = fs::File::from(fd);
+    let mut buf = Vec::with_capacity(st.st_size.max(0) as usize);
+    file.take(MAX_LOCKFILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if (buf.len() as u64) > MAX_LOCKFILE_BYTES {
+        return None;
+    }
+    Some(buf)
+}
+
 /// Compare lockfile contents between `donor_root` and `target_wt` for standard dependency entries.
 /// Returns `None` when the entry has no known lockfile present in `target_wt`, `Some(true)` on
-/// exact byte-for-byte match, and `Some(false)` if the donor's lockfile is missing or differs.
+/// exact byte-for-byte match (regular non-symlink files), and `Some(false)` otherwise.
 fn check_lockfile_match(entry: &str, donor_root: &Path, target_wt: &Path) -> Option<bool> {
     let lockfiles = lockfiles_for_entry(entry);
-    let target_lock = lockfiles
-        .iter()
-        .find(|&&name| target_wt.join(name).is_file())?;
-    let donor_path = donor_root.join(target_lock);
-    let target_path = target_wt.join(target_lock);
-    let Ok(d_meta) = fs::metadata(&donor_path) else {
+    let target_lock = lockfiles.iter().find(|&&name| {
+        fs::symlink_metadata(target_wt.join(name))
+            .map(|m| !m.file_type().is_symlink() && m.is_file())
+            .unwrap_or(false)
+    })?;
+    let target_bytes = read_regular_file_nofollow_bounded(&target_wt.join(target_lock))?;
+    let Some(donor_bytes) = read_regular_file_nofollow_bounded(&donor_root.join(target_lock))
+    else {
         return Some(false);
     };
-    let Ok(t_meta) = fs::metadata(&target_path) else {
-        return None;
-    };
-    if d_meta.len() != t_meta.len() {
-        return Some(false);
-    }
-    match (fs::read(&donor_path), fs::read(&target_path)) {
-        (Ok(a), Ok(b)) => Some(a == b),
-        _ => Some(false),
-    }
+    Some(donor_bytes == target_bytes)
 }
 
 /// Zero-config dependency auto-detection when a repository has no `.caisson.toml`.
-/// Strictly targets dependency directories (`node_modules`, `.venv`) and never build outputs.
+/// Strictly targets `node_modules` (relocatable); `.venv` embeds absolute shebang paths so
+/// Python virtualenvs remain explicit opt-in via `.caisson.toml`.
 fn auto_detect_cow_entries(wt_root: &Path) -> Vec<String> {
     let mut entries = Vec::new();
     if wt_root.join("package.json").is_file() {
         entries.push("node_modules".to_string());
     }
-    if wt_root.join("pyproject.toml").is_file() || wt_root.join("requirements.txt").is_file() {
-        entries.push(".venv".to_string());
-    }
     entries
+}
+
+/// Push a cache donor root under `base/rel_sub/name` only if no component is a symlink.
+fn push_safe_cache_candidate(
+    candidates: &mut Vec<PathBuf>,
+    base: &Path,
+    rel_sub: &str,
+    name: &str,
+) {
+    let rel = Path::new(rel_sub).join(name);
+    if ensure_no_symlink_escape(base, &rel).is_ok() {
+        let full = base.join(rel);
+        if fs::symlink_metadata(&full)
+            .map(|m| !m.file_type().is_symlink() && m.is_dir())
+            .unwrap_or(false)
+        {
+            candidates.push(full);
+        }
+    }
 }
 
 fn cow_clone_from_candidates(
@@ -824,18 +871,21 @@ pub fn wt_hydrate(config: &CaissonConfig, opts: &WtHydrateOptions) -> Result<WtH
     let target_wt = worktree_toplevel(&start_dir)?;
     let branch = worktree_current_branch(&target_wt);
 
-    // Prefer `.caisson.toml` from the target worktree if present (so branch edits apply),
-    // then the primary repository root; if neither exists, safely auto-detect standard deps.
-    let (repo_cfg, has_explicit_cfg) = if target_wt.join(".caisson.toml").is_file() {
+    // Prefer `.caisson.toml` from the target worktree for `cow_copy` paths (validated relative,
+    // symlink-safe), falling back to main repo root, or zero-config `node_modules` auto-detection.
+    // Security: `post_create` is NEVER executed automatically from a branch; it only runs when
+    // `--run-post-create` is explicitly requested and is read strictly from `main_repo_root`.
+    let main_repo_cfg = RepoConfig::load_from_repo(&repo.main_repo_root)?;
+    let (cow_cfg, has_explicit_cfg) = if target_wt.join(".caisson.toml").is_file() {
         (RepoConfig::load_from_repo(&target_wt)?, true)
     } else if repo.main_repo_root.join(".caisson.toml").is_file() {
-        (RepoConfig::load_from_repo(&repo.main_repo_root)?, true)
+        (main_repo_cfg.clone(), true)
     } else {
         (RepoConfig::default(), false)
     };
 
     let (cow_entries, auto_detected) = if has_explicit_cfg {
-        (repo_cfg.worktree.cow_copy.clone(), false)
+        (cow_cfg.worktree.cow_copy.clone(), false)
     } else {
         let detected = auto_detect_cow_entries(&target_wt);
         let is_auto = !detected.is_empty();
@@ -849,7 +899,7 @@ pub fn wt_hydrate(config: &CaissonConfig, opts: &WtHydrateOptions) -> Result<WtH
         .unwrap_or(false);
     let caisson_root = config.resolve_root();
 
-    // Build same-volume donor search order:
+    // Build same-volume donor search order (rejecting symlinked cache ancestors):
     // 1. `<volume_mount>/.caisson-cache/<repo_id>` and `<repo_name>`
     // 2. `<caisson_root>/cache/<repo_id>` and `<repo_name>` (when on same volume)
     // 3. Other git worktrees of this repo on the same volume, ordered by newest activity first.
@@ -858,14 +908,29 @@ pub fn wt_hydrate(config: &CaissonConfig, opts: &WtHydrateOptions) -> Result<WtH
 
     if let Some(ref mp) = volume_mount {
         if mp != "/" {
-            let vol_cache = PathBuf::from(mp).join(".caisson-cache");
-            candidate_roots.push(vol_cache.join(&repo.repo_id));
-            candidate_roots.push(vol_cache.join(&repo.repo_name));
+            let mp_path = Path::new(mp);
+            push_safe_cache_candidate(
+                &mut candidate_roots,
+                mp_path,
+                ".caisson-cache",
+                &repo.repo_id,
+            );
+            push_safe_cache_candidate(
+                &mut candidate_roots,
+                mp_path,
+                ".caisson-cache",
+                &repo.repo_name,
+            );
         }
     }
     if caisson_root.exists() && same_volume(&caisson_root, &target_wt).unwrap_or(false) {
-        candidate_roots.push(caisson_root.join("cache").join(&repo.repo_id));
-        candidate_roots.push(caisson_root.join("cache").join(&repo.repo_name));
+        push_safe_cache_candidate(&mut candidate_roots, &caisson_root, "cache", &repo.repo_id);
+        push_safe_cache_candidate(
+            &mut candidate_roots,
+            &caisson_root,
+            "cache",
+            &repo.repo_name,
+        );
     }
 
     let git_worktrees = list_git_worktrees(&repo.main_repo_root).unwrap_or_default();
@@ -914,8 +979,8 @@ pub fn wt_hydrate(config: &CaissonConfig, opts: &WtHydrateOptions) -> Result<WtH
 
     let mut post_create_ran = false;
     let mut post_create_command = None;
-    if !opts.no_post_create {
-        if let Some(ref hook) = repo_cfg.worktree.post_create {
+    if opts.run_post_create {
+        if let Some(ref hook) = main_repo_cfg.worktree.post_create {
             let trimmed = hook.trim();
             if !trimmed.is_empty() {
                 post_create_command = Some(trimmed.to_string());
@@ -987,10 +1052,13 @@ pub fn wt_ls(
 }
 
 /// Resolve a managed worktree entry by slug, branch name, or path.
+/// When `full_metadata` is true (e.g. `--json`), populates live git state, activity, and disk usage
+/// for the single matched worktree without scanning siblings.
 pub fn wt_path(
     config: &CaissonConfig,
     target: &str,
     repo_path: Option<&Path>,
+    full_metadata: bool,
 ) -> Result<WorktreeEntry> {
     let caisson_root = config.resolve_root();
     if !caisson_root.exists() {
@@ -1004,17 +1072,35 @@ pub fn wt_path(
         None => std::env::current_dir()?,
     };
     let current_repo = discover_repo(&cwd).ok();
+    let now = SystemTime::now();
     let all_wts = scan_managed_worktrees_with_options(
         &caisson_root,
         None,
-        SystemTime::now(),
+        now,
         ScanOptions {
             include_disk_bytes: false,
             include_git_state: false,
             include_activity: false,
         },
     )?;
-    resolve_worktree_target(target, &all_wts, current_repo.as_ref())
+    let mut matched = resolve_worktree_target(target, &all_wts, current_repo.as_ref())?;
+    if full_metadata {
+        let wt_path = Path::new(&matched.path);
+        let owner_root = matched.main_repo_root.as_deref().map(Path::new);
+        let git_state = inspect_worktree_git_state(wt_path, owner_root);
+        let last_activity = compute_last_activity(wt_path);
+        let inactive = last_activity
+            .map(|t| inactive_duration(t, now))
+            .unwrap_or_default();
+        matched.dirty = git_state.dirty;
+        matched.unpushed = git_state.unpushed;
+        matched.inspection_failed = git_state.inspection_failed;
+        matched.last_activity_utc = last_activity.map(|t| DateTime::<Utc>::from(t).to_rfc3339());
+        matched.inactive_secs = inactive.as_secs();
+        matched.inactive_human = format_age(inactive);
+        matched.disk_bytes = allocated_dir_bytes(wt_path);
+    }
+    Ok(matched)
 }
 
 /// Remove a worktree via instant `<1 ms` atomic rename to `.trash/<uuid>` + `git worktree prune`.
@@ -1086,6 +1172,62 @@ pub fn wt_rm(
     })
 }
 
+fn match_tier_unambiguous<'a>(
+    target: &str,
+    candidates: &[&'a WorktreeEntry],
+    tier_label: &str,
+) -> Result<Option<&'a WorktreeEntry>> {
+    match candidates {
+        [] => Ok(None),
+        [only] => Ok(Some(*only)),
+        many => Err(CaissonError::Message(format!(
+            "ambiguous worktree '{target}' matches {} entries by {tier_label} ({}); pass full path to disambiguate",
+            many.len(),
+            many.iter()
+                .map(|w| format!("{}/{}", w.repo_id, w.slug))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+fn resolve_within_scope<'a>(
+    target: &str,
+    slug_candidate: &str,
+    pool: &[&'a WorktreeEntry],
+) -> Result<Option<&'a WorktreeEntry>> {
+    // Tier A: exact slug match
+    let exact_slug: Vec<&WorktreeEntry> =
+        pool.iter().copied().filter(|w| w.slug == target).collect();
+    if let Some(found) = match_tier_unambiguous(target, &exact_slug, "slug")? {
+        return Ok(Some(found));
+    }
+
+    // Tier B: exact branch match
+    let exact_branch: Vec<&WorktreeEntry> = pool
+        .iter()
+        .copied()
+        .filter(|w| w.branch.as_deref() == Some(target))
+        .collect();
+    if let Some(found) = match_tier_unambiguous(target, &exact_branch, "branch")? {
+        return Ok(Some(found));
+    }
+
+    // Tier C: sanitized slug match (e.g. `feat/foo` -> `feat-foo`)
+    if slug_candidate != target {
+        let sanitized: Vec<&WorktreeEntry> = pool
+            .iter()
+            .copied()
+            .filter(|w| w.slug == slug_candidate)
+            .collect();
+        if let Some(found) = match_tier_unambiguous(target, &sanitized, "sanitized slug")? {
+            return Ok(Some(found));
+        }
+    }
+
+    Ok(None)
+}
+
 fn resolve_worktree_target(
     target: &str,
     all_wts: &[WorktreeEntry],
@@ -1094,52 +1236,43 @@ fn resolve_worktree_target(
     // 1. Exact path match (canonicalized if possible)
     let target_path = Path::new(target);
     let canon_target = fs::canonicalize(target_path).ok();
-    if let Some(found) = all_wts.iter().find(|w| {
-        w.path == target
-            || canon_target
-                .as_ref()
-                .and_then(|ct| fs::canonicalize(&w.path).ok().map(|cw| cw == *ct))
-                .unwrap_or(false)
-    }) {
+    let path_matches: Vec<&WorktreeEntry> = all_wts
+        .iter()
+        .filter(|w| {
+            w.path == target
+                || canon_target
+                    .as_ref()
+                    .and_then(|ct| fs::canonicalize(&w.path).ok().map(|cw| cw == *ct))
+                    .unwrap_or(false)
+        })
+        .collect();
+    if let Some(found) = match_tier_unambiguous(target, &path_matches, "path")? {
         return Ok(found.clone());
     }
 
     let slug_candidate = sanitize_slug(target).unwrap_or_else(|_| target.to_string());
 
-    // 2. Prefer current repo matches by slug or branch
+    // 2. Prefer current repo with strict tier precedence (slug -> branch -> sanitized slug),
+    //    never silently picking an arbitrary entry if a tier has multiple matches.
     if let Some(repo) = current_repo {
-        if let Some(found) = all_wts.iter().find(|w| {
-            w.repo_id == repo.repo_id
-                && (w.slug == target
-                    || w.slug == slug_candidate
-                    || w.branch.as_deref() == Some(target))
-        }) {
+        let repo_pool: Vec<&WorktreeEntry> = all_wts
+            .iter()
+            .filter(|w| w.repo_id == repo.repo_id)
+            .collect();
+        if let Some(found) = resolve_within_scope(target, &slug_candidate, &repo_pool)? {
             return Ok(found.clone());
         }
     }
 
-    // 3. Fallback across all repos if unambiguous
-    let global_matches: Vec<&WorktreeEntry> = all_wts
-        .iter()
-        .filter(|w| {
-            w.slug == target || w.slug == slug_candidate || w.branch.as_deref() == Some(target)
-        })
-        .collect();
-
-    match global_matches.as_slice() {
-        [only] => Ok((*only).clone()),
-        [] => Err(CaissonError::Message(format!(
-            "worktree '{target}' not found (run `caisson wt ls --all` to list managed worktrees)"
-        ))),
-        many => Err(CaissonError::Message(format!(
-            "ambiguous worktree '{target}' matches {} repos ({}); pass full path or run inside the target repo",
-            many.len(),
-            many.iter()
-                .map(|w| format!("{}/{}", w.repo_id, w.slug))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))),
+    // 3. Global fallback across all repos with the same strict tier precedence & ambiguity check.
+    let global_pool: Vec<&WorktreeEntry> = all_wts.iter().collect();
+    if let Some(found) = resolve_within_scope(target, &slug_candidate, &global_pool)? {
+        return Ok(found.clone());
     }
+
+    Err(CaissonError::Message(format!(
+        "worktree '{target}' not found (run `caisson wt ls --all` to list managed worktrees)"
+    )))
 }
 
 /// Prune inactive worktrees (dry-run by default; pass `--apply` to remove).

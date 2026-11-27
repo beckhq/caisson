@@ -1,6 +1,6 @@
 [package]
 name = "caisson"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Fast, native macOS CLI for daemon-shielded sibling APFS developer workspaces and Copy-on-Write git worktrees"
 license = "MIT"

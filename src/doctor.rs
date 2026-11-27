@@ -3,13 +3,16 @@ use crate::apfs::shield::{inspect_shields, parse_mdutil_disabled, ShieldStatus};
 use crate::apfs::statfs::same_volume;
 use crate::apfs::volume::list_registered_volumes;
 use crate::config::CaissonConfig;
-use crate::daemon::launchd::{daemon_status, DaemonStatus, LAUNCH_DAEMON_PLIST_PATH};
+use crate::daemon::launchd::{
+    daemon_status, DaemonStatus, LAUNCH_DAEMON_BIN_PATH, LAUNCH_DAEMON_PLIST_PATH,
+};
 use crate::error::Result;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::Instant;
 
 pub const TRACKED_DAEMONS: &[&str] = &[
     "mds_stores",
@@ -55,6 +58,15 @@ pub struct VolumeShieldAudit {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SyspolicydProbe {
+    pub first_exec_ms: f64,
+    pub cached_exec_ms: f64,
+    pub overhead_ms: f64,
+    pub stalled: bool,
+    pub responsible_process: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
     pub macos_version: String,
     pub chip: String,
@@ -70,6 +82,10 @@ pub struct DoctorReport {
     pub leaked_temp_mounts: Vec<String>,
     pub caisson_volumes: Vec<VolumeShieldAudit>,
     pub launch_daemon: DaemonStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon_binary_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub syspolicyd_probe: Option<SyspolicydProbe>,
     pub developer_tools_hint: String,
     pub warnings: Vec<DoctorWarning>,
 }
@@ -312,6 +328,8 @@ pub fn run_doctor(registry_path: &Path, config: &CaissonConfig) -> Result<Doctor
     }
 
     let launch_daemon = daemon_status(Path::new(LAUNCH_DAEMON_PLIST_PATH));
+    let daemon_binary_version = inspect_daemon_binary_version(&launch_daemon);
+    let syspolicyd_probe = probe_syspolicyd_exec_latency();
     let developer_tools_hint = "Ensure your terminal/IDE is authorized in System Settings -> Privacy & Security -> Developer Tools (or run `spctl developer-mode enable-terminal`) to reduce syspolicyd/XProtect scanning overhead on freshly compiled local binaries.".to_string();
 
     let mut warnings = Vec::new();
@@ -382,6 +400,42 @@ pub fn run_doctor(registry_path: &Path, config: &CaissonConfig) -> Result<Doctor
         warnings.push(t3_warning);
     }
 
+    if let Some(ref daemon_ver) = daemon_binary_version {
+        let cli_ver = env!("CARGO_PKG_VERSION");
+        if daemon_ver != cli_ver {
+            warnings.push(DoctorWarning {
+                code: "STALE_DAEMON_BINARY".to_string(),
+                severity: "warn".to_string(),
+                message: format!(
+                    "Installed LaunchDaemon binary ({}) is v{}, while the running CLI is v{}",
+                    LAUNCH_DAEMON_BIN_PATH, daemon_ver, cli_ver
+                ),
+                remediation:
+                    "Refresh the LaunchDaemon binary and plist with `sudo caisson daemon install`."
+                        .to_string(),
+            });
+        }
+    }
+
+    if let Some(ref probe) = syspolicyd_probe {
+        if probe.stalled {
+            let proc_desc = probe
+                .responsible_process
+                .as_deref()
+                .map(|p| format!(" (responsible ancestor: `{}`)", p))
+                .unwrap_or_default();
+            warnings.push(DoctorWarning {
+                code: "SYSPOLICYD_EXEC_TAX".to_string(),
+                severity: "warn".to_string(),
+                message: format!(
+                    "First execution of freshly compiled binaries is stalling by +{:.1} ms ({:.1} ms 1st exec vs {:.1} ms cached) due to macOS syspolicyd/XProtect scanning{}",
+                    probe.overhead_ms, probe.first_exec_ms, probe.cached_exec_ms, proc_desc
+                ),
+                remediation: "Enable Developer Tools for your terminal/IDE in System Settings -> Privacy & Security -> Developer Tools (note: standalone background daemons launched outside the .app bundle do not inherit the .app exemption).".to_string(),
+            });
+        }
+    }
+
     for vol in &caisson_volumes {
         if !vol.shields.all_healthy {
             let fsevents_label = if vol.shields.fseventsd_no_log {
@@ -423,15 +477,133 @@ pub fn run_doctor(registry_path: &Path, config: &CaissonConfig) -> Result<Doctor
         leaked_temp_mounts,
         caisson_volumes,
         launch_daemon,
+        daemon_binary_version,
+        syspolicyd_probe,
         developer_tools_hint,
         warnings,
+    })
+}
+
+/// Inspect the installed LaunchDaemon binary's version (read-only, zero sudo).
+fn inspect_daemon_binary_version(daemon: &DaemonStatus) -> Option<String> {
+    if !daemon.installed {
+        return None;
+    }
+    let bin_path = daemon
+        .program_arguments
+        .first()
+        .map(String::as_str)
+        .unwrap_or(LAUNCH_DAEMON_BIN_PATH);
+    if !Path::new(bin_path).is_file() {
+        return None;
+    }
+    let out = Command::new(bin_path).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    // Expected format: `caisson 0.1.5`
+    raw.split_whitespace().nth(1).map(ToString::to_string)
+}
+
+/// Walk the current process ancestor chain to identify the top-level process under `launchd` (`ppid == 1`).
+fn detect_responsible_process() -> Option<String> {
+    let mut pid = std::process::id();
+    let mut top_comm: Option<String> = None;
+    for _ in 0..16 {
+        let out = Command::new("ps")
+            .args(["-o", "ppid=,comm=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if line.is_empty() {
+            break;
+        }
+        let mut parts = line.split_whitespace();
+        let ppid: u32 = parts.next()?.parse().ok()?;
+        let comm = parts.collect::<Vec<_>>().join(" ");
+        if !comm.is_empty() {
+            top_comm = Some(comm);
+        }
+        if ppid <= 1 || ppid == pid {
+            break;
+        }
+        pid = ppid;
+    }
+    top_comm
+}
+
+/// Measure real `syspolicyd` / `XProtect` first-exec overhead in the current shell/IDE/agent host
+/// by compiling two tiny `int main(void){return 0;}` binaries (using binary #2 to avoid cold dyld
+/// cache noise) and comparing 1st exec vs 2nd cached exec latency.
+fn probe_syspolicyd_exec_latency() -> Option<SyspolicydProbe> {
+    if cfg!(test) {
+        return None;
+    }
+    struct ProbeDirGuard(std::path::PathBuf);
+    impl Drop for ProbeDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir_path =
+        std::env::temp_dir().join(format!("caisson-exec-probe-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&dir_path).ok()?;
+    let _guard = ProbeDirGuard(dir_path.clone());
+    let src = dir_path.join("probe.c");
+    fs::write(&src, "int main(void) { return 0; }\n").ok()?;
+
+    // Binary 1 warms up dyld / temp-dir caches; binary 2 measures true steady-state syspolicyd scan.
+    let bin1 = dir_path.join("p1");
+    let bin2 = dir_path.join("p2");
+    for bin in [&bin1, &bin2] {
+        let status = Command::new("cc")
+            .args(["-O0", src.to_str()?, "-o", bin.to_str()?])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        if !status.success() {
+            return None;
+        }
+    }
+    let _ = Command::new(&bin1).status().ok()?;
+
+    let t0 = Instant::now();
+    let s1 = Command::new(&bin2).status().ok()?;
+    let first_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if !s1.success() {
+        return None;
+    }
+
+    let t1 = Instant::now();
+    let s2 = Command::new(&bin2).status().ok()?;
+    let cached_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    if !s2.success() {
+        return None;
+    }
+
+    let overhead_ms = (first_ms - cached_ms).max(0.0);
+    let stalled = overhead_ms >= 30.0;
+    let responsible_process = if stalled {
+        detect_responsible_process()
+    } else {
+        None
+    };
+
+    Some(SyspolicydProbe {
+        first_exec_ms: round1(first_ms),
+        cached_exec_ms: round1(cached_ms),
+        overhead_ms: round1(overhead_ms),
+        stalled,
+        responsible_process,
     })
 }
 
 use crate::t3::{recommend_t3_worktrees_path, resolve_t3_worktrees_dir};
 
 /// Emit an informational finding if T3 Code's active worktrees directory does not reside on a
-/// Caisson-shielded APFS volume.
+/// mounted, healthy Caisson-shielded APFS volume.
 pub fn detect_unshielded_t3_worktrees(
     home: &Path,
     caisson_volumes: &[VolumeShieldAudit],
@@ -441,7 +613,10 @@ pub fn detect_unshielded_t3_worktrees(
 
     let on_caisson_volume = caisson_volumes.iter().any(|v| {
         let mp = Path::new(&v.mount_point);
-        mp.exists() && same_volume(&resolved, mp).unwrap_or(false)
+        v.shields.mounted
+            && v.shields.all_healthy
+            && mp.exists()
+            && same_volume(&resolved, mp).unwrap_or(false)
     });
     if on_caisson_volume {
         return None;
@@ -571,6 +746,14 @@ pub fn format_doctor_human(report: &DoctorReport) -> String {
         }
     }
 
+    if let Some(ref probe) = report.syspolicyd_probe {
+        let state = if probe.stalled { "STALLED" } else { "OK" };
+        out.push_str(&format!(
+            "\nExec Probe: [{state}] fresh binary {:.1} ms vs {:.1} ms cached (+{:.1} ms syspolicyd)\n",
+            probe.first_exec_ms, probe.cached_exec_ms, probe.overhead_ms
+        ));
+    }
+
     if !report.warnings.is_empty() {
         out.push_str("\nFindings:\n");
         for w in &report.warnings {
@@ -671,12 +854,26 @@ mod tests {
         .unwrap();
         assert_eq!(resolve_t3_worktrees_dir(dir.path()), Some(custom.clone()));
 
-        // When the configured dir resides on a registered Caisson volume, no warning is emitted.
+        // When the configured dir resides on a healthy mounted Caisson volume, no warning is emitted.
+        let mut healthy_shields = inspect_shields(&custom);
+        healthy_shields.mounted = true;
+        healthy_shields.all_healthy = true;
         let fake_vol = VolumeShieldAudit {
             name: "caisson".to_string(),
             mount_point: custom.display().to_string(),
-            shields: inspect_shields(&custom),
+            shields: healthy_shields,
         };
         assert!(detect_unshielded_t3_worktrees(dir.path(), &[fake_vol]).is_none());
+
+        // An unhealthy Caisson volume must NOT suppress the warning.
+        let mut degraded_shields = inspect_shields(&custom);
+        degraded_shields.mounted = true;
+        degraded_shields.all_healthy = false;
+        let bad_vol = VolumeShieldAudit {
+            name: "caisson".to_string(),
+            mount_point: custom.display().to_string(),
+            shields: degraded_shields,
+        };
+        assert!(detect_unshielded_t3_worktrees(dir.path(), &[bad_vol]).is_some());
     }
 }
