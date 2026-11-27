@@ -191,6 +191,7 @@ caisson config set quotas.soft_disk_limit 400G
 | `caisson watch --label <name> --out <jsonl> [--watch-pid <pid>]` | Passive build telemetry sampler (`JSONL` + `.summary.json`) |
 | `caisson status` / `caisson vol ls` | Inspect container capacity, volumes, shields, and daemon state |
 | `caisson config show \| get \| set` | View or live-edit soft quotas without `sudo` |
+| `caisson agent status \| install \| uninstall \| dismiss \| snippet` | Wire up coding agents (Claude Code, Codex, Antigravity, Cursor, OpenCode, Windsurf) |
 | `caisson completions <zsh\|bash\|fish>` | Generate shell completions |
 | `caisson shell-init <zsh\|bash\|fish> [--alias cai]` | Enable `caisson wt cd <slug>` shell navigation |
 
@@ -206,6 +207,25 @@ Every command supports `--json` for coding agents, scripts, and menu-bar compani
 | `sudo caisson vol destroy <name> [--yes] [--dry-run]` | O(1) delete a Caisson volume (**triple-checked safety guard**) |
 | `sudo caisson daemon install \| uninstall` | Manage one-shot boot LaunchDaemon (`dev.caisson.mount`) |
 | `sudo caisson mount-all` | Mount & re-apply `noatime` / shields on registered volumes |
+
+---
+
+## Coding Agent Integration
+
+Caisson ships an official Agent Skill ([`skills/caisson/SKILL.md`](./skills/caisson/SKILL.md)) embedded right inside the binary so Claude Code, OpenAI Codex, Antigravity (AGY), Cursor, OpenCode, and Windsurf automatically prefer `caisson wt` over raw `git worktree` on `/`.
+
+```bash
+# Detect installed agents and install SKILL.md interactively (supports opt-out like `-cursor`)
+caisson agent install
+
+# Check installed vs detected coding agents
+caisson agent status
+
+# Print a concise snippet for any repository's AGENTS.md / CLAUDE.md
+caisson agent snippet
+```
+
+During interactive `sudo caisson init`, Caisson detects your installed coding agents and offers to install the skill right away (pass `--no-agents` to skip). If you install a new coding agent later, interactive `caisson status` / `caisson doctor` / `caisson wt add` runs print a one-line tip on stderr offering `caisson agent install <agent>` (or `caisson agent dismiss <agent>` to silence).
 
 ---
 

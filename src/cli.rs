@@ -58,6 +58,10 @@ pub enum Commands {
         /// Print planned privileged operations without executing them.
         #[arg(long)]
         dry_run: bool,
+
+        /// Skip the interactive coding-agent skill setup prompt after volume creation.
+        #[arg(long)]
+        no_agents: bool,
     },
 
     /// Manage dedicated Tier-2 APFS volumes (create, ls, shield, destroy).
@@ -160,6 +164,55 @@ pub enum Commands {
         #[arg(long)]
         alias: Option<String>,
     },
+
+    /// Manage coding-agent skill integration (Claude Code, Codex, Antigravity, Cursor, OpenCode, Windsurf).
+    Agent {
+        #[command(subcommand)]
+        action: AgentCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentCommands {
+    /// Show detected coding agents and whether the Caisson skill is installed.
+    Status,
+
+    /// Install the official Caisson `SKILL.md` for detected or specified coding agents (zero sudo).
+    Install {
+        /// Specific agent IDs (e.g. `claude`, `codex`, `antigravity`, `cursor`, `opencode`, `windsurf`, `agents`).
+        targets: Vec<String>,
+
+        /// Install for all detected agents without prompting.
+        #[arg(long)]
+        all: bool,
+
+        /// Preview planned skill installations without writing files.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Remove installed Caisson `SKILL.md` files for specified agents (or `--all`).
+    Uninstall {
+        /// Specific agent IDs to uninstall.
+        targets: Vec<String>,
+
+        /// Uninstall from every agent where the Caisson skill is installed.
+        #[arg(long)]
+        all: bool,
+
+        /// Preview planned removals without deleting files.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Silence passive discovery tips for specified coding agents.
+    Dismiss {
+        /// Agent IDs to silence (e.g. `codex`, `cursor`).
+        targets: Vec<String>,
+    },
+
+    /// Print a concise drop-in snippet for repo-level `AGENTS.md` / `CLAUDE.md` files.
+    Snippet,
 }
 
 #[derive(Debug, Subcommand)]

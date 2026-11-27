@@ -658,3 +658,67 @@ fn review_regressions_prune_scope_git_failure_and_symlink_containment() {
     assert_eq!(esc_json["cow_clones"][0]["status"], "skipped");
     assert!(!escape_target.join("deps").exists());
 }
+
+#[test]
+fn cli_agent_status_install_dismiss_uninstall_and_snippet() {
+    let sandbox = tempdir().unwrap();
+    let fake_home = sandbox.path().join("home");
+    let config_path = sandbox.path().join("config.toml");
+    fs::create_dir_all(fake_home.join(".claude")).unwrap();
+    fs::create_dir_all(fake_home.join(".codex")).unwrap();
+
+    // 1. `agent status --json` detects claude and codex
+    let st = Command::new(caisson_bin())
+        .env("CAISSON_HOME", &fake_home)
+        .env("CAISSON_CONFIG", &config_path)
+        .args(["agent", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+    let st_json: Value = serde_json::from_slice(&st.stdout).unwrap();
+    let claude = st_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == "claude")
+        .unwrap();
+    assert_eq!(claude["detected"], true);
+    assert_eq!(claude["installed"], false);
+
+    // 2. `agent install claude --json` installs SKILL.md
+    let inst = Command::new(caisson_bin())
+        .env("CAISSON_HOME", &fake_home)
+        .env("CAISSON_CONFIG", &config_path)
+        .args(["agent", "install", "claude", "--json"])
+        .output()
+        .unwrap();
+    assert!(inst.status.success());
+    assert!(fake_home.join(".claude/skills/caisson/SKILL.md").is_file());
+
+    // 3. `agent dismiss codex --json` persists dismissal
+    let dis = Command::new(caisson_bin())
+        .env("CAISSON_HOME", &fake_home)
+        .env("CAISSON_CONFIG", &config_path)
+        .args(["agent", "dismiss", "codex", "--json"])
+        .output()
+        .unwrap();
+    assert!(dis.status.success());
+
+    // 4. `agent uninstall claude --json` removes SKILL.md
+    let uninst = Command::new(caisson_bin())
+        .env("CAISSON_HOME", &fake_home)
+        .env("CAISSON_CONFIG", &config_path)
+        .args(["agent", "uninstall", "claude", "--json"])
+        .output()
+        .unwrap();
+    assert!(uninst.status.success());
+    assert!(!fake_home.join(".claude/skills/caisson/SKILL.md").exists());
+
+    // 5. `agent snippet` prints drop-in AGENTS.md instructions
+    let snip = Command::new(caisson_bin())
+        .args(["agent", "snippet"])
+        .output()
+        .unwrap();
+    assert!(snip.status.success());
+    assert!(String::from_utf8_lossy(&snip.stdout).contains("caisson wt add"));
+}

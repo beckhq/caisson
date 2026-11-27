@@ -1,10 +1,15 @@
+use caisson::agents::{
+    dismiss_agents, inspect_agents, install_agent_skills, maybe_notify_new_agents,
+    prompt_interactive_agent_setup, resolve_user_home, uninstall_agent_skills, AGENTS_MD_SNIPPET,
+};
 use caisson::apfs::clonefile::clone_path;
 use caisson::apfs::volume::{
     build_status_report, create_volume, destroy_volume, list_registered_volumes, shield_volume,
     CreateVolumeOptions, QuotaSpec,
 };
 use caisson::cli::{
-    Cli, Commands, ConfigCommands, DaemonCommands, ShellKind, VolCommands, WtCommands,
+    AgentCommands, Cli, Commands, ConfigCommands, DaemonCommands, ShellKind, VolCommands,
+    WtCommands,
 };
 use caisson::config::CaissonConfig;
 use caisson::daemon::launchd::{
@@ -96,6 +101,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             container,
             mount,
             dry_run,
+            no_agents,
         } => {
             let quota_spec = if no_quota {
                 QuotaSpec::None
@@ -137,6 +143,21 @@ fn dispatch(cli: Cli) -> Result<()> {
                         println!("    - [{}] {}: {}", step.status, step.step, cmd);
                     } else {
                         println!("    - [{}] {}", step.status, step.step);
+                    }
+                }
+                if !dry_run && !no_agents {
+                    let home = resolve_user_home();
+                    let mut cfg = CaissonConfig::load_from(&config_path)?;
+                    if let Some(agent_report) =
+                        prompt_interactive_agent_setup(&home, &config_path, &mut cfg)?
+                    {
+                        println!(
+                            "Installed Caisson skill for {} agent(s):",
+                            agent_report.targets.len()
+                        );
+                        for t in &agent_report.targets {
+                            println!("  - {} -> {}", t.id, t.skill_path);
+                        }
                     }
                 }
             }
@@ -322,6 +343,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                         }
                     );
                 }
+                maybe_notify_new_agents(&config, json);
             }
         }
 
@@ -460,6 +482,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 print_json(&report)?;
             } else {
                 print!("{}", format_doctor_human(&report));
+                maybe_notify_new_agents(&cfg, json);
             }
         }
 
@@ -554,6 +577,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                         }
                         // Print canonical worktree path on stdout for easy shell capture (`cd "$(caisson wt add ...)"`).
                         println!("{}", report.path);
+                        maybe_notify_new_agents(&cfg, json);
                     }
                 }
 
@@ -722,6 +746,132 @@ fn dispatch(cli: Cli) -> Result<()> {
 
         Commands::ShellInit { shell, alias } => {
             print!("{}", render_shell_init(shell, alias.as_deref()));
+        }
+
+        Commands::Agent { action } => {
+            let home = resolve_user_home();
+            let mut cfg = CaissonConfig::load_from(&config_path)?;
+            match action {
+                AgentCommands::Status => {
+                    let statuses = inspect_agents(&home, &cfg);
+                    if json {
+                        print_json(&statuses)?;
+                    } else {
+                        println!(
+                            "{:<14} {:<10} {:<10} {:<10} SKILL PATH",
+                            "AGENT", "DETECTED", "INSTALLED", "DISMISSED"
+                        );
+                        for s in &statuses {
+                            println!(
+                                "{:<14} {:<10} {:<10} {:<10} {}",
+                                s.id, s.detected, s.installed, s.dismissed, s.skill_path
+                            );
+                        }
+                    }
+                }
+
+                AgentCommands::Install {
+                    targets,
+                    all,
+                    dry_run,
+                } => {
+                    let report = if targets.is_empty() && !all && !dry_run && !json {
+                        let interactive = unsafe {
+                            libc::isatty(libc::STDIN_FILENO) != 0
+                                && libc::isatty(libc::STDOUT_FILENO) != 0
+                        };
+                        if interactive {
+                            match prompt_interactive_agent_setup(&home, &config_path, &mut cfg)? {
+                                Some(r) => r,
+                                None => {
+                                    println!("No new agent skills installed.");
+                                    return Ok(());
+                                }
+                            }
+                        } else {
+                            let r = install_agent_skills(&home, &mut cfg, &[], false, false)?;
+                            cfg.save_to(&config_path)?;
+                            r
+                        }
+                    } else {
+                        let r = install_agent_skills(&home, &mut cfg, &targets, all, dry_run)?;
+                        if !dry_run {
+                            cfg.save_to(&config_path)?;
+                        }
+                        r
+                    };
+
+                    if json {
+                        print_json(&report)?;
+                    } else if report.targets.is_empty() {
+                        println!("No matching coding agents detected (pass explicit IDs like `caisson agent install claude codex`).");
+                    } else {
+                        let prefix = if report.dry_run { "[dry-run] " } else { "" };
+                        println!(
+                            "{prefix}Installed Caisson skill for {} agent(s):",
+                            report.targets.len()
+                        );
+                        for t in &report.targets {
+                            println!("  - {} ({}) -> {}", t.id, t.display_name, t.skill_path);
+                        }
+                    }
+                }
+
+                AgentCommands::Uninstall {
+                    targets,
+                    all,
+                    dry_run,
+                } => {
+                    let report = uninstall_agent_skills(&home, &mut cfg, &targets, all, dry_run)?;
+                    if !dry_run {
+                        cfg.save_to(&config_path)?;
+                    }
+                    if json {
+                        print_json(&report)?;
+                    } else {
+                        let prefix = if report.dry_run { "[dry-run] " } else { "" };
+                        println!(
+                            "{prefix}Removed Caisson skill for {} agent(s):",
+                            report.targets.len()
+                        );
+                        for t in &report.targets {
+                            println!("  - {} ({})", t.id, t.skill_path);
+                        }
+                    }
+                }
+
+                AgentCommands::Dismiss { targets } => {
+                    let report = dismiss_agents(&home, &mut cfg, &targets)?;
+                    cfg.save_to(&config_path)?;
+                    if json {
+                        print_json(&report)?;
+                    } else {
+                        println!(
+                            "Silenced passive discovery tips for: {}",
+                            report
+                                .targets
+                                .iter()
+                                .map(|t| t.id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                }
+
+                AgentCommands::Snippet => {
+                    if json {
+                        #[derive(Serialize)]
+                        struct SnippetOut {
+                            snippet: &'static str,
+                        }
+                        print_json(&SnippetOut {
+                            snippet: AGENTS_MD_SNIPPET,
+                        })?;
+                    } else {
+                        print!("{AGENTS_MD_SNIPPET}");
+                    }
+                }
+            }
         }
     }
 

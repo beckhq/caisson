@@ -16,6 +16,14 @@ pub struct CaissonConfig {
     pub volume_root: Option<String>,
     pub quotas: QuotaConfig,
     pub prune: PruneConfig,
+    pub agents: AgentsConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AgentsConfig {
+    pub installed: Vec<String>,
+    pub dismissed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,11 +86,8 @@ impl CaissonConfig {
                 return PathBuf::from(override_path);
             }
         }
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        PathBuf::from(home)
-            .join(".config")
-            .join("caisson")
-            .join("config.toml")
+        let home = crate::agents::resolve_user_home();
+        home.join(".config").join("caisson").join("config.toml")
     }
 
     /// Resolve the active Tier-1 caisson root directory.
