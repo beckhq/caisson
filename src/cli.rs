@@ -51,6 +51,10 @@ pub enum Commands {
         #[arg(long)]
         container: Option<String>,
 
+        /// Target the APFS container backing an existing mounted volume (e.g. `/Volumes/my-ssd`).
+        #[arg(long)]
+        on: Option<PathBuf>,
+
         /// Custom mount point path (defaults to `/Volumes/<name>`).
         #[arg(long)]
         mount: Option<PathBuf>,
@@ -351,6 +355,10 @@ pub enum VolCommands {
         /// Explicit APFS container reference (e.g. `disk3`); auto-detected if omitted.
         #[arg(long)]
         container: Option<String>,
+
+        /// Target the APFS container backing an existing mounted volume (e.g. `/Volumes/my-ssd`).
+        #[arg(long)]
+        on: Option<PathBuf>,
 
         /// Custom mount point path (defaults to `/Volumes/<name>`).
         #[arg(long)]

@@ -100,6 +100,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             case_sensitive,
             nobrowse,
             container,
+            on,
             mount,
             dry_run,
             no_agents,
@@ -114,6 +115,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     name,
                     tier: VolumeTier::Tier1,
                     container,
+                    on_volume: on,
                     mount_point: mount,
                     quota: quota_spec,
                     case_sensitive,
@@ -171,6 +173,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 case_sensitive,
                 nobrowse,
                 container,
+                on,
                 mount,
                 dry_run,
             } => {
@@ -183,6 +186,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                         name,
                         tier: VolumeTier::Tier2,
                         container,
+                        on_volume: on,
                         mount_point: mount,
                         quota: quota_spec,
                         case_sensitive,
@@ -301,7 +305,26 @@ fn dispatch(cli: Cli) -> Result<()> {
             if json {
                 print_json(&status)?;
             } else {
-                if let Some(ref c) = status.internal_container {
+                if !status.containers.is_empty() {
+                    println!("Containers:  {} APFS container(s)", status.containers.len());
+                    for c in &status.containers {
+                        let loc = if c.internal { "internal" } else { "external" };
+                        let mounts = if c.mount_points.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", c.mount_points.join(", "))
+                        };
+                        println!(
+                            "  - {} ({}, {} free / {} total, {} vols){}",
+                            c.container_reference,
+                            loc,
+                            format_bytes(c.capacity_free),
+                            format_bytes(c.capacity_ceiling),
+                            c.volume_count,
+                            mounts
+                        );
+                    }
+                } else if let Some(ref c) = status.internal_container {
                     println!(
                         "Container:   {} ({} free / {} total, {} volumes)",
                         c.container_reference,

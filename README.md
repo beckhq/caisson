@@ -30,19 +30,36 @@ When you run parallel coding agents (`git worktree`) or heavy C++/Rust/Xcode/Chr
 
 ## Benchmarks
 
+### 1. Real-World Multi-Worktree Provisioning & Teardown (Alternating A/B/B/A/A/B)
+
+Measured across 3 alternating pairs (6 runs, 30 worktrees total) on Apple Silicon APFS using a real Next.js/TypeScript dependency tree (**43,485 files / 605 MiB logical `node_modules`** per worktree = **217,425 files / 3.0 GiB logical** per 5-worktree batch). The baseline uses offline warm-store `pnpm install --offline --frozen-lockfile --ignore-scripts` (best-case zero-network package manager) on `/` and standard `git worktree remove --force`:
+
+| Metric (5 worktrees x 43,485-file `node_modules`) | Main HD (`/` + offline `pnpm`) | **Caisson (`/Volumes/caisson`)** | Delta |
+| :--- | ---: | ---: | ---: |
+| **Provision 5 worktrees** | 11.88 s *(11.87-12.11 s)* | **6.88 s** *(5.80-7.03 s)* | **1.73x faster (-42.1%)** |
+| **Interactive teardown (5 worktrees)** | 9.79 s *(9.70-10.37 s)* | **0.158 s** *(0.154-0.168 s)* | **62.0x faster (-98.4%)** |
+| **End-to-end interactive wait** | 22.97 s *(22.85-23.43 s)* | **8.22 s** *(7.15-8.39 s)* | **2.79x faster (-64.2%)** |
+| **End-to-end incl. full `gc` unlink drain** | 22.97 s | **13.26 s** *(12.40-13.44 s)* | **1.73x faster (-42.3%)** |
+| **Total macOS daemon CPU** | 38.58 s *(37.71-39.67 s)* | **10.22 s** *(10.10-10.28 s)* | **-73.5%** |
+| **`fseventsd` CPU** | 33.27 s | **8.57 s** | **-74.2%** |
+| **`mds_stores` CPU** | 1.58 s | **0.00 s** | **-100.0%** |
+| **Physical APFS disk delta (3.0 GiB logical)** | 120.9 MiB | **88.2 MiB** | **-27.0% metadata overhead** |
+
+### 2. Storage Strategy Matrix (Default `/` vs `.noindex` vs `.sparseimage` vs Sibling APFS)
+
 Measured across a 4-way matrix on Apple Silicon APFS (12 parallel git worktrees + dependency cloning + 600-file compile + 15k small-file write storm + teardown):
 
-| Storage Strategy | `mds_stores` CPU | Total Daemon CPU | 12× Worktrees | 15k Small Files | Teardown | End-to-End Wall |
+| Storage Strategy | `mds_stores` CPU | Total Daemon CPU | 12x Worktrees | 15k Small Files | Teardown | End-to-End Wall |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Main APFS (default) | 7.80 s | 36.93 s | 2.47 s | 0.58 s | 7.64 s (`rm -rf`) | 28.36 s |
 | Main APFS + `.noindex` | 7.49 s | 37.82 s | 2.41 s | 0.57 s | 7.83 s (`rm -rf`) | 27.15 s |
-| Shielded `.sparseimage` | 2.33 s | 18.51 s | 6.99 s *(3.1× slower)* | 3.65 s *(6.7× slower)* | 0.45 s | 33.53 s |
+| Shielded `.sparseimage` | 2.33 s | 18.51 s | 6.99 s *(3.1x slower)* | 3.65 s *(6.7x slower)* | 0.45 s | 33.53 s |
 | **Caisson (Sibling APFS)** | **0.06 s (-99.2%)** | **14.47 s (-60.8%)** | **2.26 s** | **0.54 s** | **1.44 s (O(1))** | **20.56 s (-27.5%)** |
 
 Key takeaways:
 - **`.noindex` on `/` gave 0% relief** (`mds_stores` 7.49 s vs 7.80 s, total daemon CPU 37.82 s vs 36.93 s).
-- **`.sparseimage` penalized small-file I/O by 6.7×** and parallel worktrees by 3.1× due to APFS-on-APFS sparse allocation overhead.
-- **Sibling APFS volume** eliminated **99.2%** of `mds_stores` CPU and **60.8%** of total OS daemon CPU with native kernel NVMe speed.
+- **`.sparseimage` penalized small-file I/O by 6.7x** and parallel worktrees by 3.1x due to APFS-on-APFS sparse allocation overhead.
+- **Sibling APFS volume** eliminated **99.2%-100%** of `mds_stores` CPU and **61%-74%** of total OS daemon CPU with native kernel NVMe speed.
 
 ---
 
@@ -181,6 +198,7 @@ caisson config set quotas.soft_disk_limit 400G
 | Command | Purpose |
 | :--- | :--- |
 | `caisson wt add <branch> [--from <ref>] [--name <slug>] [--no-cow] [--force]` | Create a shielded CoW git worktree on `/Volumes/caisson` |
+| `caisson wt hydrate [--dry-run] [--no-post-create]` | APFS CoW-clone `.caisson.toml` `cow_copy` paths into any existing worktree (T3 Code / IDE hook) |
 | `caisson wt ls [--all]` | List worktrees with idle age, dirty/unpushed flags, and size |
 | `caisson wt path <target>` | Print canonical path of a worktree (powers `wt cd`) |
 | `caisson wt rm <target> [--force] [--sync]` | Instant `<1 ms` atomic rename to `.trash/` + async unlink |
@@ -201,8 +219,8 @@ Every command supports `--json` for coding agents, scripts, and menu-bar compani
 
 | Command | Purpose |
 | :--- | :--- |
-| `sudo caisson init [--quota auto\|<size>\|none] [--case-sensitive] [--dry-run]` | Create & shield Tier-1 `/Volumes/caisson` once |
-| `sudo caisson vol create <name> [--quota 300g] [--case-sensitive] [--nobrowse]` | Create & shield a dedicated Tier-2 build volume |
+| `sudo caisson init [--on /Volumes/<ssd>] [--quota auto\|<size>\|none] [--case-sensitive] [--dry-run]` | Create & shield Tier-1 `/Volumes/caisson` once (internal or external APFS container) |
+| `sudo caisson vol create <name> [--on /Volumes/<ssd>] [--quota 300g] [--case-sensitive] [--nobrowse]` | Create & shield a dedicated Tier-2 build volume |
 | `sudo caisson vol shield <name>` | Idempotently re-apply all 7 daemon shields |
 | `sudo caisson vol destroy <name> [--yes] [--dry-run]` | O(1) delete a Caisson volume (**triple-checked safety guard**) |
 | `sudo caisson daemon install \| uninstall` | Manage one-shot boot LaunchDaemon (`dev.caisson.mount`) |
@@ -226,6 +244,13 @@ caisson agent snippet
 ```
 
 During interactive `sudo caisson init`, Caisson detects your installed coding agents and offers to install the skill right away (pass `--no-agents` to skip). If you install a new coding agent later, interactive `caisson status` / `caisson doctor` / `caisson wt add` runs print a one-line tip on stderr offering `caisson agent install <agent>` (or `caisson agent dismiss <agent>` to silence).
+
+### T3 Code & External Worktree Managers
+
+For host-managed worktree tools like **T3 Code**:
+1. Point T3 Code's **Worktree location** setting (`worktreesDirectory` in Settings -> Worktrees) to `/Volumes/caisson/t3-worktrees` (or a shielded volume on an external Thunderbolt/USB4 APFS SSD created via `sudo caisson vol create <name> --on /Volumes/<ssd> --nobrowse`).
+2. Add `caisson wt hydrate` as a project setup script (`runOnWorktreeCreate`) alongside a repo `.caisson.toml` with `cow_copy = ["node_modules"]`. Every new thread automatically CoW-clones dependencies from sibling worktrees on the same APFS volume.
+3. Run `sudo caisson daemon install` once; `dev.caisson.mount` uses `RunAtLoad` + `StartOnMount` so shields and `noatime` persist across reboots and external SSD reconnects.
 
 ---
 

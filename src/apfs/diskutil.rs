@@ -216,6 +216,36 @@ pub fn diskutil_info(target: &str) -> Result<DiskutilInfoPlist> {
     parse_diskutil_info_plist(&output.stdout)
 }
 
+/// Resolve the APFS container reference (e.g. `disk3` or `disk5`) backing an existing mount path
+/// (such as `/` or `/Volumes/external-ssd`).
+pub fn resolve_container_for_path(path: &Path) -> Result<String> {
+    if !path.exists() {
+        return Err(CaissonError::Message(format!(
+            "path '{}' does not exist",
+            path.display()
+        )));
+    }
+    let canon = std::fs::canonicalize(path)?;
+    let info = diskutil_info(&canon.display().to_string())?;
+    info.apfs_container_reference
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            CaissonError::Message(format!(
+                "'{}' is not backed by an APFS container",
+                canon.display()
+            ))
+        })
+}
+
+/// Return true if the APFS container (e.g. `disk5`) resides on an external drive.
+pub fn is_external_container(container_ref: &str) -> bool {
+    diskutil_info(container_ref)
+        .ok()
+        .and_then(|info| info.internal)
+        .map(|internal| !internal)
+        .unwrap_or(false)
+}
+
 /// Auto-detect the internal APFS container hosting macOS (`/`).
 pub fn detect_internal_container() -> Result<ApfsContainer> {
     let apfs = list_apfs()?;
@@ -782,6 +812,7 @@ mod tests {
             tier: VolumeTier::Tier1,
             case_sensitive: false,
             nobrowse: false,
+            is_external: false,
             quota_bytes: Some(250 * GIB),
             owner: Some("dev".to_string()),
             created_at: Utc::now(),
@@ -1066,6 +1097,8 @@ mod tests {
         assert!(!apfs.containers.is_empty());
         let primary = detect_internal_container().unwrap();
         assert!(primary.capacity_ceiling > 0);
+        let root_container = resolve_container_for_path(Path::new("/")).unwrap();
+        assert_eq!(root_container, primary.container_reference);
     }
 
     #[test]

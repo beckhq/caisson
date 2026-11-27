@@ -56,6 +56,7 @@ fn privileged_apfs_create_shield_and_destroy_roundtrip() {
             name: vol_name.clone(),
             tier: VolumeTier::Tier2,
             container: None,
+            on_volume: None,
             mount_point: None,
             quota: QuotaSpec::Bytes(5 * caisson::units::GIB),
             case_sensitive: false,

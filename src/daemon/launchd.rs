@@ -77,6 +77,8 @@ pub fn generate_plist_xml(caisson_bin: &Path) -> Result<String> {
         ]),
     );
     dict.insert("RunAtLoad".to_string(), Value::Boolean(true));
+    dict.insert("StartOnMount".to_string(), Value::Boolean(true));
+    dict.insert("ThrottleInterval".to_string(), Value::Integer(5.into()));
     dict.insert("KeepAlive".to_string(), Value::Boolean(false));
     dict.insert(
         "StandardOutPath".to_string(),
@@ -420,14 +422,25 @@ pub fn mount_all(registry_path: &Path, dry_run: bool) -> Result<MountAllReport> 
 
     for vol in &registry.volumes {
         let Some((_, live_vol)) = apfs.find_volume_by_uuid(&vol.uuid) else {
-            results.push(MountAllVolumeResult {
-                name: vol.name.clone(),
-                uuid: vol.uuid.clone(),
-                mount_point: vol.mount_point.clone(),
-                mounted_action: "missing".to_string(),
-                shield_report: None,
-                error: Some(format!("volume UUID {} not found on system", vol.uuid)),
-            });
+            if vol.is_external {
+                results.push(MountAllVolumeResult {
+                    name: vol.name.clone(),
+                    uuid: vol.uuid.clone(),
+                    mount_point: vol.mount_point.clone(),
+                    mounted_action: "offline".to_string(),
+                    shield_report: None,
+                    error: None,
+                });
+            } else {
+                results.push(MountAllVolumeResult {
+                    name: vol.name.clone(),
+                    uuid: vol.uuid.clone(),
+                    mount_point: vol.mount_point.clone(),
+                    mounted_action: "missing".to_string(),
+                    shield_report: None,
+                    error: Some(format!("volume UUID {} not found on system", vol.uuid)),
+                });
+            }
             continue;
         };
 
@@ -747,6 +760,15 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            dict.get("StartOnMount").and_then(|v| v.as_boolean()),
+            Some(true)
+        );
+        assert_eq!(
+            dict.get("ThrottleInterval")
+                .and_then(|v| v.as_signed_integer()),
+            Some(5)
+        );
+        assert_eq!(
             dict.get("KeepAlive").and_then(|v| v.as_boolean()),
             Some(false)
         );
@@ -806,5 +828,35 @@ mod tests {
             present.program_arguments,
             vec![LAUNCH_DAEMON_BIN_PATH, "mount-all"]
         );
+    }
+
+    #[test]
+    fn mount_all_treats_unplugged_external_volume_as_offline_without_error() {
+        let dir = tempdir().unwrap();
+        let reg_path = dir.path().join("registry.json");
+        let ext = crate::registry::RegisteredVolume {
+            name: "ext-ssd".to_string(),
+            uuid: "99999999-8888-7777-6666-555555555555".to_string(),
+            container: "disk99".to_string(),
+            mount_point: "/Volumes/ext-ssd".to_string(),
+            tier: crate::registry::VolumeTier::Tier2,
+            case_sensitive: false,
+            nobrowse: true,
+            is_external: true,
+            quota_bytes: None,
+            owner: None,
+            created_at: chrono::Utc::now(),
+        };
+        VolumeRegistry::with_locked_update(&reg_path, |r| {
+            r.upsert(ext);
+            Ok(())
+        })
+        .unwrap();
+
+        let report = mount_all(&reg_path, true).unwrap();
+        assert!(!report.has_errors());
+        assert_eq!(report.volumes.len(), 1);
+        assert_eq!(report.volumes[0].mounted_action, "offline");
+        assert!(report.volumes[0].error.is_none());
     }
 }

@@ -223,12 +223,37 @@ fn validate_and_trash_managed_worktree(
     trash_worktree(caisson_root, &canonical_wt, sync)
 }
 
-/// Scan managed worktrees under `<caisson_root>/worktrees/`.
+#[derive(Debug, Clone, Copy)]
+struct ScanOptions {
+    include_disk_bytes: bool,
+    include_git_state: bool,
+    include_activity: bool,
+}
+
+/// Scan managed worktrees under `<caisson_root>/worktrees/` with full disk, git, and activity data.
 /// Never follows symlinked `worktrees/`, `<repo-id>/`, or `<slug>/` directories.
 pub fn scan_managed_worktrees(
     caisson_root: &Path,
     repo_filter: Option<&str>,
     now: SystemTime,
+) -> Result<Vec<WorktreeEntry>> {
+    scan_managed_worktrees_with_options(
+        caisson_root,
+        repo_filter,
+        now,
+        ScanOptions {
+            include_disk_bytes: true,
+            include_git_state: true,
+            include_activity: true,
+        },
+    )
+}
+
+fn scan_managed_worktrees_with_options(
+    caisson_root: &Path,
+    repo_filter: Option<&str>,
+    now: SystemTime,
+    opts: ScanOptions,
 ) -> Result<Vec<WorktreeEntry>> {
     let worktrees_base = caisson_root.join("worktrees");
     match fs::symlink_metadata(&worktrees_base) {
@@ -284,14 +309,27 @@ pub fn scan_managed_worktrees(
             let owner_root = owner_repo_root_from_worktree(&wt_path);
             let orphaned = owner_root.as_ref().map(|r| !r.exists()).unwrap_or(true);
             let branch = worktree_current_branch(&wt_path);
-            let git_state = inspect_worktree_git_state(&wt_path, owner_root.as_deref());
+            let git_state = if opts.include_git_state {
+                inspect_worktree_git_state(&wt_path, owner_root.as_deref())
+            } else {
+                crate::worktree::git::WorktreeGitState::default()
+            };
 
-            let last_activity = compute_last_activity(&wt_path);
-            let inactive = last_activity
-                .map(|t| inactive_duration(t, now))
-                .unwrap_or_default();
-            let last_activity_utc = last_activity.map(|t| DateTime::<Utc>::from(t).to_rfc3339());
-            let disk_bytes = allocated_dir_bytes(&wt_path);
+            let (last_activity_utc, inactive_secs, inactive_human) = if opts.include_activity {
+                let last_activity = compute_last_activity(&wt_path);
+                let inactive = last_activity
+                    .map(|t| inactive_duration(t, now))
+                    .unwrap_or_default();
+                let utc = last_activity.map(|t| DateTime::<Utc>::from(t).to_rfc3339());
+                (utc, inactive.as_secs(), format_age(inactive))
+            } else {
+                (None, 0, "0m".to_string())
+            };
+            let disk_bytes = if opts.include_disk_bytes {
+                allocated_dir_bytes(&wt_path)
+            } else {
+                0
+            };
 
             results.push(WorktreeEntry {
                 repo_id: repo_id.clone(),
@@ -300,8 +338,8 @@ pub fn scan_managed_worktrees(
                 main_repo_root: owner_root.map(|p| p.display().to_string()),
                 branch,
                 last_activity_utc,
-                inactive_secs: inactive.as_secs(),
-                inactive_human: format_age(inactive),
+                inactive_secs,
+                inactive_human,
                 dirty: git_state.dirty,
                 unpushed: git_state.unpushed,
                 inspection_failed: git_state.inspection_failed,
@@ -332,31 +370,69 @@ pub fn wt_add(config: &CaissonConfig, opts: &WtAddOptions) -> Result<WtAddReport
     ensure_caisson_root_ready(&caisson_root)?;
 
     let now = SystemTime::now();
-    let all_wts = scan_managed_worktrees(&caisson_root, None, now)?;
+    // Fast metadata-only scan: never walk `allocated_dir_bytes` or run `git status` on sibling
+    // worktrees on the happy path (prevents O(N^2 * files) slowdown with large `node_modules`).
+    let all_wts = scan_managed_worktrees_with_options(
+        &caisson_root,
+        None,
+        now,
+        ScanOptions {
+            include_disk_bytes: false,
+            include_git_state: false,
+            include_activity: false,
+        },
+    )?;
     let repo_wts_count = all_wts.iter().filter(|w| w.repo_id == repo.repo_id).count();
-    let default_inactive = config.default_inactive_duration()?;
-    let reclaimable = all_wts
-        .iter()
-        .filter(|w| {
-            w.inactive_secs >= default_inactive.as_secs()
-                && !w.inspection_failed
-                && (!config.prune.protect_dirty || !w.dirty)
-                && (!config.prune.protect_unpushed || !w.unpushed)
-        })
-        .count();
-
     let (caisson_used_bytes, host_available_bytes) = measure_root_usage(&caisson_root)?;
-    let quota_outcome = evaluate_add_quotas(
+
+    let quota_outcome = match evaluate_add_quotas(
         config,
         &QuotaSnapshot {
             repo_worktrees: repo_wts_count,
             total_worktrees: all_wts.len(),
-            reclaimable_worktrees: reclaimable,
+            reclaimable_worktrees: 0,
             caisson_used_bytes,
             host_available_bytes,
         },
         opts.force,
-    )?;
+    ) {
+        Ok(outcome) => outcome,
+        Err(CaissonError::QuotaExceeded { .. }) => {
+            // Only compute exact reclaimable inactive count when a soft quota is actually hit.
+            let full_wts = scan_managed_worktrees_with_options(
+                &caisson_root,
+                None,
+                now,
+                ScanOptions {
+                    include_disk_bytes: false,
+                    include_git_state: true,
+                    include_activity: true,
+                },
+            )?;
+            let default_inactive = config.default_inactive_duration()?;
+            let reclaimable = full_wts
+                .iter()
+                .filter(|w| {
+                    w.inactive_secs >= default_inactive.as_secs()
+                        && !w.inspection_failed
+                        && (!config.prune.protect_dirty || !w.dirty)
+                        && (!config.prune.protect_unpushed || !w.unpushed)
+                })
+                .count();
+            evaluate_add_quotas(
+                config,
+                &QuotaSnapshot {
+                    repo_worktrees: repo_wts_count,
+                    total_worktrees: full_wts.len(),
+                    reclaimable_worktrees: reclaimable,
+                    caisson_used_bytes,
+                    host_available_bytes,
+                },
+                opts.force,
+            )?
+        }
+        Err(e) => return Err(e),
+    };
 
     let slug = match opts.name {
         Some(ref explicit) => sanitize_slug(explicit)?,
@@ -823,7 +899,16 @@ pub fn wt_path(
         None => std::env::current_dir()?,
     };
     let current_repo = discover_repo(&cwd).ok();
-    let all_wts = scan_managed_worktrees(&caisson_root, None, SystemTime::now())?;
+    let all_wts = scan_managed_worktrees_with_options(
+        &caisson_root,
+        None,
+        SystemTime::now(),
+        ScanOptions {
+            include_disk_bytes: false,
+            include_git_state: false,
+            include_activity: false,
+        },
+    )?;
     resolve_worktree_target(target, &all_wts, current_repo.as_ref())
 }
 
@@ -844,7 +929,16 @@ pub fn wt_rm(
         None => std::env::current_dir()?,
     };
     let current_repo = discover_repo(&cwd).ok();
-    let all_wts = scan_managed_worktrees(&caisson_root, None, SystemTime::now())?;
+    let all_wts = scan_managed_worktrees_with_options(
+        &caisson_root,
+        None,
+        SystemTime::now(),
+        ScanOptions {
+            include_disk_bytes: false,
+            include_git_state: false,
+            include_activity: false,
+        },
+    )?;
 
     let matched = resolve_worktree_target(target, &all_wts, current_repo.as_ref())?;
     let wt_path = Path::new(&matched.path);

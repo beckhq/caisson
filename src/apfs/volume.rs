@@ -1,7 +1,8 @@
 use crate::apfs::diskutil::{
     build_add_volume_args, compute_auto_quota, detect_internal_container, diskutil_info,
-    execute_add_volume, execute_delete_volume, is_custom_mount_point, list_apfs,
-    validate_safe_custom_mount_dir, validate_volume_name, verify_destroy_safety, ApfsContainer,
+    execute_add_volume, execute_delete_volume, is_custom_mount_point, is_external_container,
+    list_apfs, resolve_container_for_path, validate_safe_custom_mount_dir, validate_volume_name,
+    verify_destroy_safety, ApfsContainer,
 };
 use crate::apfs::shield::{
     apply_shields, inspect_shields, ShieldApplyReport, ShieldOptions, ShieldStatus,
@@ -43,6 +44,7 @@ pub struct CreateVolumeOptions {
     pub name: String,
     pub tier: VolumeTier,
     pub container: Option<String>,
+    pub on_volume: Option<PathBuf>,
     pub mount_point: Option<PathBuf>,
     pub quota: QuotaSpec,
     pub case_sensitive: bool,
@@ -99,6 +101,7 @@ pub struct VolumeDestroyReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusReport {
     pub internal_container: Option<ContainerSummary>,
+    pub containers: Vec<ContainerSummary>,
     pub tier1_root: String,
     pub tier1_root_exists: bool,
     pub volumes: Vec<VolumeStatusEntry>,
@@ -110,19 +113,30 @@ pub struct StatusReport {
 pub struct ContainerSummary {
     pub container_reference: String,
     pub uuid: String,
+    pub internal: bool,
     pub capacity_ceiling: u64,
     pub capacity_free: u64,
     pub volume_count: usize,
+    pub mount_points: Vec<String>,
 }
 
-impl From<&ApfsContainer> for ContainerSummary {
-    fn from(c: &ApfsContainer) -> Self {
+impl ContainerSummary {
+    pub fn from_apfs(c: &ApfsContainer) -> Self {
+        let internal = !is_external_container(&c.container_reference);
+        let mount_points = c
+            .volumes
+            .iter()
+            .filter_map(|v| v.mount_point.clone())
+            .filter(|m| !m.is_empty() && !m.starts_with("/System/Volumes/"))
+            .collect();
         Self {
             container_reference: c.container_reference.clone(),
             uuid: c.uuid.clone(),
+            internal,
             capacity_ceiling: c.capacity_ceiling,
             capacity_free: c.capacity_free,
             volume_count: c.volumes.len(),
+            mount_points,
         }
     }
 }
@@ -134,8 +148,20 @@ pub fn create_volume(
 ) -> Result<VolumeCreateReport> {
     validate_volume_name(&opts.name)?;
 
+    if opts.container.is_some() && opts.on_volume.is_some() {
+        return Err(CaissonError::Message(
+            "pass either `--container <diskX>` or `--on <mountpoint>`, not both".to_string(),
+        ));
+    }
+
+    let resolved_container_ref = match (&opts.container, &opts.on_volume) {
+        (Some(c), None) => Some(c.clone()),
+        (None, Some(path)) => Some(resolve_container_for_path(path)?),
+        _ => None,
+    };
+
     let apfs_before = list_apfs()?;
-    let container = match opts.container {
+    let container = match resolved_container_ref {
         Some(ref c_ref) => apfs_before
             .find_container(c_ref)
             .cloned()
@@ -305,6 +331,11 @@ pub fn create_volume(
         quota_bytes
     };
 
+    let is_external = live_info
+        .internal
+        .map(|internal| !internal)
+        .unwrap_or_else(|| is_external_container(&container.container_reference));
+
     let registered = RegisteredVolume {
         name: opts.name.clone(),
         uuid: created_vol.uuid.clone(),
@@ -313,6 +344,7 @@ pub fn create_volume(
         tier: opts.tier,
         case_sensitive: opts.case_sensitive,
         nobrowse: opts.nobrowse,
+        is_external,
         quota_bytes: effective_quota,
         owner: owner.clone(),
         created_at: Utc::now(),
@@ -666,9 +698,25 @@ fn confirm_destroy_interactive(volume_name: &str, uuid: &str) -> Result<()> {
 
 /// Build the full unprivileged `caisson status` report.
 pub fn build_status_report(registry_path: &Path, config: &CaissonConfig) -> Result<StatusReport> {
+    let apfs = list_apfs().ok();
     let internal_container = detect_internal_container()
         .ok()
-        .map(|c| ContainerSummary::from(&c));
+        .map(|c| ContainerSummary::from_apfs(&c));
+    let containers = apfs
+        .map(|a| {
+            a.containers
+                .iter()
+                .filter(|c| {
+                    // Exclude Apple firmware/recovery-only system containers (`iSCPreboot`, `Recovery`, etc.).
+                    c.volumes.iter().any(|v| {
+                        v.has_protected_role().is_none()
+                            || v.roles.iter().any(|r| r.eq_ignore_ascii_case("Data"))
+                    })
+                })
+                .map(ContainerSummary::from_apfs)
+                .collect()
+        })
+        .unwrap_or_default();
     let volumes = list_registered_volumes(registry_path)?;
     let tier1_root = config.resolve_root();
     let tier1_root_exists = tier1_root.exists();
@@ -676,6 +724,7 @@ pub fn build_status_report(registry_path: &Path, config: &CaissonConfig) -> Resu
 
     Ok(StatusReport {
         internal_container,
+        containers,
         tier1_root: tier1_root.display().to_string(),
         tier1_root_exists,
         volumes,
@@ -713,6 +762,7 @@ mod tests {
             name: "caisson-dryrun-test".to_string(),
             tier: VolumeTier::Tier1,
             container: None,
+            on_volume: None,
             mount_point: None,
             quota: QuotaSpec::Auto,
             case_sensitive: false,

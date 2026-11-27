@@ -29,6 +29,8 @@ pub struct RegisteredVolume {
     pub tier: VolumeTier,
     pub case_sensitive: bool,
     pub nobrowse: bool,
+    #[serde(default)]
+    pub is_external: bool,
     pub quota_bytes: Option<u64>,
     pub owner: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -348,6 +350,7 @@ mod tests {
             tier: VolumeTier::Tier1,
             case_sensitive: false,
             nobrowse: false,
+            is_external: false,
             quota_bytes: Some(250 * 1024 * 1024 * 1024),
             owner: Some("dev".to_string()),
             created_at: Utc::now(),
