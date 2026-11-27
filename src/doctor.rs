@@ -485,7 +485,7 @@ pub fn run_doctor(registry_path: &Path, config: &CaissonConfig) -> Result<Doctor
 }
 
 /// Inspect the installed LaunchDaemon binary's version (read-only, zero sudo).
-fn inspect_daemon_binary_version(daemon: &DaemonStatus) -> Option<String> {
+pub fn inspect_daemon_binary_version(daemon: &DaemonStatus) -> Option<String> {
     if !daemon.installed {
         return None;
     }
@@ -536,7 +536,7 @@ fn detect_responsible_process() -> Option<String> {
 /// Measure real `syspolicyd` / `XProtect` first-exec overhead in the current shell/IDE/agent host
 /// by compiling two tiny `int main(void){return 0;}` binaries (using binary #2 to avoid cold dyld
 /// cache noise) and comparing 1st exec vs 2nd cached exec latency.
-fn probe_syspolicyd_exec_latency() -> Option<SyspolicydProbe> {
+pub fn probe_syspolicyd_exec_latency() -> Option<SyspolicydProbe> {
     if cfg!(test) {
         return None;
     }

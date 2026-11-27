@@ -44,6 +44,25 @@ pub struct CowCloneOutcome {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CopiedFileOutcome {
+    pub entry: String,
+    pub source: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FallbackInstallOutcome {
+    pub package_manager: String,
+    pub command: String,
+    pub reason: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct WtAddReport {
     pub repo_id: String,
     pub main_repo_root: String,
@@ -51,6 +70,10 @@ pub struct WtAddReport {
     pub slug: String,
     pub path: String,
     pub cow_clones: Vec<CowCloneOutcome>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub copied_files: Vec<CopiedFileOutcome>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_env_files: Vec<String>,
     pub post_create_ran: bool,
     pub warnings: Vec<String>,
 }
@@ -123,6 +146,7 @@ pub struct WtHydrateOptions {
     pub path: Option<PathBuf>,
     pub dry_run: bool,
     pub run_post_create: bool,
+    pub fallback_install: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -136,6 +160,12 @@ pub struct WtHydrateReport {
     pub auto_detected: bool,
     pub dry_run: bool,
     pub cow_clones: Vec<CowCloneOutcome>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub copied_files: Vec<CopiedFileOutcome>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_env_files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_install: Option<FallbackInstallOutcome>,
     pub post_create_ran: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_create_command: Option<String>,
@@ -480,6 +510,15 @@ pub fn wt_add(config: &CaissonConfig, opts: &WtAddOptions) -> Result<WtAddReport
         }
     }
 
+    // Apply opt-in `copy_files` strictly from the trusted main repo `.caisson.toml`.
+    let copied_files = copy_opt_in_files(
+        &repo.main_repo_root,
+        &target_path,
+        &repo_cfg.worktree.copy_files,
+        false,
+    );
+    let missing_env_files = detect_missing_env_files(&repo.main_repo_root, &target_path);
+
     let mut post_create_ran = false;
     if let Some(ref hook) = repo_cfg.worktree.post_create {
         let trimmed = hook.trim();
@@ -509,6 +548,8 @@ pub fn wt_add(config: &CaissonConfig, opts: &WtAddOptions) -> Result<WtAddReport
         slug,
         path: target_path.display().to_string(),
         cow_clones,
+        copied_files,
+        missing_env_files,
         post_create_ran,
         warnings: quota_outcome.warnings,
     })
@@ -977,6 +1018,24 @@ pub fn wt_hydrate(config: &CaissonConfig, opts: &WtHydrateOptions) -> Result<WtH
         ));
     }
 
+    // Optional `--fallback-install`: runs BEFORE `copy_files` so `.env*` secrets are never
+    // present in the worktree during package-manager execution. Enforces offline + `--ignore-scripts`.
+    let fallback_install = if opts.fallback_install {
+        maybe_run_fallback_install(&target_wt, &cow_clones, opts.dry_run)?
+    } else {
+        None
+    };
+
+    // Apply opt-in `copy_files` strictly from the trusted main repo `.caisson.toml` via pinned
+    // directory descriptors (`openat`/`mkdirat`/`linkat`), preserving restrictive permissions.
+    let copied_files = copy_opt_in_files(
+        &repo.main_repo_root,
+        &target_wt,
+        &main_repo_cfg.worktree.copy_files,
+        opts.dry_run,
+    );
+    let missing_env_files = detect_missing_env_files(&repo.main_repo_root, &target_wt);
+
     let mut post_create_ran = false;
     let mut post_create_command = None;
     if opts.run_post_create {
@@ -1015,9 +1074,508 @@ pub fn wt_hydrate(config: &CaissonConfig, opts: &WtHydrateOptions) -> Result<WtH
         auto_detected,
         dry_run: opts.dry_run,
         cow_clones,
+        copied_files,
+        missing_env_files,
+        fallback_install,
         post_create_ran,
         post_create_command,
     })
+}
+
+/// Open a directory strictly without following symlinks on its final component.
+fn open_dir_nofollow_fd(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// Walk a relative directory chain from a pinned directory `OwnedFd` without following symlinks.
+/// When `create` is true, creates missing intermediate directories via `mkdirat`.
+fn walk_dir_components_at(
+    root_fd: &std::os::fd::OwnedFd,
+    comps: &[&std::ffi::OsStr],
+    create: bool,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let dup_fd = unsafe { libc::fcntl(root_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut cur = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+
+    for comp in comps {
+        let c_name = CString::new(comp.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path component")
+        })?;
+        if create {
+            let rc = unsafe { libc::mkdirat(cur.as_raw_fd(), c_name.as_ptr(), 0o755) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(err);
+                }
+            }
+        }
+        let next = unsafe {
+            libc::openat(
+                cur.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if next < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        cur = unsafe { OwnedFd::from_raw_fd(next) };
+    }
+    Ok(cur)
+}
+
+/// Read a regular file relative to a pinned directory `OwnedFd` (`O_NOFOLLOW | O_NONBLOCK`, <= 16 MiB)
+/// and return both its bytes and its POSIX mode bits.
+fn read_regular_file_at_bounded(
+    dir_fd: &std::os::fd::OwnedFd,
+    leaf: &std::ffi::OsStr,
+) -> std::io::Result<(Vec<u8>, u32)> {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    const MAX_COPY_BYTES: u64 = 16 * 1024 * 1024;
+    let c_name = CString::new(leaf.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in filename"))?;
+    let raw_fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source is not a regular file",
+        ));
+    }
+    if (st.st_size as u64) > MAX_COPY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "source exceeds 16 MiB safety limit",
+        ));
+    }
+    let file = fs::File::from(fd);
+    let mut buf = Vec::with_capacity(st.st_size.max(0) as usize);
+    file.take(MAX_COPY_BYTES + 1).read_to_end(&mut buf)?;
+    if (buf.len() as u64) > MAX_COPY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "source exceeds 16 MiB safety limit",
+        ));
+    }
+    Ok((buf, (st.st_mode as u32) & 0o777))
+}
+
+/// Atomically publish `bytes` into `parent_fd / leaf` without overwriting any existing entry
+/// (via exclusive temp file + `fchmod` + `linkat` + `unlinkat`).
+fn atomic_create_file_at(
+    parent_fd: &std::os::fd::OwnedFd,
+    leaf: &std::ffi::OsStr,
+    bytes: &[u8],
+    mode: u32,
+) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp_name = format!(".caisson-copy-tmp-{}", uuid::Uuid::new_v4());
+    let c_tmp = CString::new(tmp_name.as_bytes()).unwrap();
+    let c_leaf = CString::new(leaf.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in filename"))?;
+
+    let raw_fd = unsafe {
+        libc::openat(
+            parent_fd.as_raw_fd(),
+            c_tmp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600u32,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let mut file = fs::File::from(owned);
+
+    let write_res = (|| -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    })();
+    drop(file);
+
+    if let Err(e) = write_res {
+        unsafe {
+            libc::unlinkat(parent_fd.as_raw_fd(), c_tmp.as_ptr(), 0);
+        }
+        return Err(e);
+    }
+
+    let link_rc = unsafe {
+        libc::linkat(
+            parent_fd.as_raw_fd(),
+            c_tmp.as_ptr(),
+            parent_fd.as_raw_fd(),
+            c_leaf.as_ptr(),
+            0,
+        )
+    };
+    let link_err = if link_rc != 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    unsafe {
+        libc::unlinkat(parent_fd.as_raw_fd(), c_tmp.as_ptr(), 0);
+    }
+    if let Some(e) = link_err {
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Copy opt-in relative regular files (e.g. `.env.local`) from the trusted `main_repo_root`
+/// into `target_wt` if not already present, walking strictly from pinned directory descriptors.
+fn copy_opt_in_files(
+    main_repo_root: &Path,
+    target_wt: &Path,
+    entries: &[String],
+    dry_run: bool,
+) -> Vec<CopiedFileOutcome> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut results = Vec::new();
+    let Ok(main_fd) = open_dir_nofollow_fd(main_repo_root) else {
+        return results;
+    };
+    let Ok(wt_fd) = open_dir_nofollow_fd(target_wt) else {
+        return results;
+    };
+
+    for entry in entries {
+        let rel = match validate_relative_cow_entry(entry) {
+            Ok(p) => p,
+            Err(e) => {
+                results.push(CopiedFileOutcome {
+                    entry: entry.clone(),
+                    source: None,
+                    status: "skipped".to_string(),
+                    detail: Some(e.to_string()),
+                });
+                continue;
+            }
+        };
+        let comps: Vec<&std::ffi::OsStr> = rel
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        let Some((leaf, parent_comps)) = comps.split_last() else {
+            continue;
+        };
+
+        let src_display = main_repo_root.join(&rel).display().to_string();
+        let src_parent_fd = match walk_dir_components_at(&main_fd, parent_comps, false) {
+            Ok(fd) => fd,
+            Err(_) => {
+                results.push(CopiedFileOutcome {
+                    entry: entry.clone(),
+                    source: None,
+                    status: "skipped".to_string(),
+                    detail: Some(
+                        "source parent directory not found or symlinked in main repo".to_string(),
+                    ),
+                });
+                continue;
+            }
+        };
+
+        let (bytes, src_mode) = match read_regular_file_at_bounded(&src_parent_fd, leaf) {
+            Ok(pair) => pair,
+            Err(e) => {
+                results.push(CopiedFileOutcome {
+                    entry: entry.clone(),
+                    source: None,
+                    status: "skipped".to_string(),
+                    detail: Some(format!("source unavailable in main repo: {e}")),
+                });
+                continue;
+            }
+        };
+
+        // Check destination existence through pinned descriptors if parent already exists.
+        if let Ok(existing_dst_parent) = walk_dir_components_at(&wt_fd, parent_comps, false) {
+            if let Ok(c_leaf) = CString::new(leaf.as_bytes()) {
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    libc::fstatat(
+                        existing_dst_parent.as_raw_fd(),
+                        c_leaf.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if rc == 0 {
+                    results.push(CopiedFileOutcome {
+                        entry: entry.clone(),
+                        source: Some(src_display),
+                        status: "skipped".to_string(),
+                        detail: Some("destination already exists".to_string()),
+                    });
+                    continue;
+                }
+            }
+        }
+
+        if dry_run {
+            results.push(CopiedFileOutcome {
+                entry: entry.clone(),
+                source: Some(src_display),
+                status: "planned".to_string(),
+                detail: None,
+            });
+            continue;
+        }
+
+        let dst_parent_fd = match walk_dir_components_at(&wt_fd, parent_comps, true) {
+            Ok(fd) => fd,
+            Err(e) => {
+                results.push(CopiedFileOutcome {
+                    entry: entry.clone(),
+                    source: Some(src_display),
+                    status: "skipped".to_string(),
+                    detail: Some(format!("unsafe or inaccessible destination parent: {e}")),
+                });
+                continue;
+            }
+        };
+
+        let is_env = leaf
+            .to_str()
+            .map(|n| n.starts_with(".env"))
+            .unwrap_or(false);
+        // Never widen permissions beyond source; clamp `.env*` to owner-only read/write.
+        let target_mode = if is_env {
+            let clamped = src_mode & 0o600;
+            if clamped == 0 {
+                0o600
+            } else {
+                clamped
+            }
+        } else {
+            src_mode & 0o777
+        };
+
+        match atomic_create_file_at(&dst_parent_fd, leaf, &bytes, target_mode) {
+            Ok(()) => results.push(CopiedFileOutcome {
+                entry: entry.clone(),
+                source: Some(src_display),
+                status: "copied".to_string(),
+                detail: None,
+            }),
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => results.push(CopiedFileOutcome {
+                entry: entry.clone(),
+                source: Some(src_display),
+                status: "skipped".to_string(),
+                detail: Some("destination already exists".to_string()),
+            }),
+            Err(e) => results.push(CopiedFileOutcome {
+                entry: entry.clone(),
+                source: Some(src_display),
+                status: "failed".to_string(),
+                detail: Some(e.to_string()),
+            }),
+        }
+    }
+
+    results
+}
+
+/// Detect top-level `.env*` regular files present in `main_repo_root` that are absent (or
+/// non-regular / dangling symlink) in `target_wt` (excluding public template files).
+fn detect_missing_env_files(main_repo_root: &Path, target_wt: &Path) -> Vec<String> {
+    let mut missing = Vec::new();
+    let Ok(rd) = fs::read_dir(main_repo_root) else {
+        return missing;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(".env") {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            ".env.example" | ".env.sample" | ".env.template" | ".env.dist" | ".env.defaults"
+        ) || lower.ends_with(".example")
+            || lower.ends_with(".sample")
+            || lower.ends_with(".template")
+        {
+            continue;
+        }
+        let src = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&src) else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let dst_is_usable_file = fs::metadata(target_wt.join(&name))
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        if !dst_is_usable_file {
+            missing.push(name);
+        }
+    }
+    missing.sort();
+    missing
+}
+
+/// Detect the Node/JS package manager from lockfiles in `target_wt` and run a strict
+/// offline + `--ignore-scripts` fallback install directly (without `/bin/sh`) when `node_modules`
+/// had no donor or a lockfile diff.
+fn maybe_run_fallback_install(
+    target_wt: &Path,
+    cow_clones: &[CowCloneOutcome],
+    dry_run: bool,
+) -> Result<Option<FallbackInstallOutcome>> {
+    if !target_wt.join("package.json").is_file() {
+        return Ok(None);
+    }
+    let nm_outcome = cow_clones
+        .iter()
+        .find(|c| c.entry.trim_matches('/') == "node_modules");
+
+    let reason = if let Some(nm) = nm_outcome {
+        if matches!(nm.status.as_str(), "cloned" | "planned") && nm.lockfile_match == Some(false) {
+            "lockfile-mismatch"
+        } else if nm.status == "skipped" && !target_wt.join("node_modules").exists() {
+            "no-donor"
+        } else if nm.status == "failed" {
+            "clone-failed"
+        } else {
+            return Ok(None);
+        }
+    } else if !target_wt.join("node_modules").exists() {
+        "missing-node-modules"
+    } else {
+        return Ok(None);
+    };
+
+    let (pm, args): (&str, &[&str]) = if target_wt.join("pnpm-lock.yaml").is_file() {
+        (
+            "pnpm",
+            &[
+                "install",
+                "--frozen-lockfile",
+                "--offline",
+                "--ignore-scripts",
+            ],
+        )
+    } else if target_wt.join("bun.lock").is_file() || target_wt.join("bun.lockb").is_file() {
+        ("bun", &["install", "--frozen-lockfile", "--ignore-scripts"])
+    } else if target_wt.join("yarn.lock").is_file() {
+        (
+            "yarn",
+            &[
+                "install",
+                "--frozen-lockfile",
+                "--offline",
+                "--ignore-scripts",
+            ],
+        )
+    } else if target_wt.join("package-lock.json").is_file() {
+        ("npm", &["ci", "--offline", "--ignore-scripts"])
+    } else {
+        return Ok(Some(FallbackInstallOutcome {
+            package_manager: "unknown".to_string(),
+            command: String::new(),
+            reason: reason.to_string(),
+            status: "skipped".to_string(),
+            detail: Some("no recognized lockfile found in target worktree".to_string()),
+        }));
+    };
+
+    let cmd_display = format!("{pm} {}", args.join(" "));
+    if dry_run {
+        return Ok(Some(FallbackInstallOutcome {
+            package_manager: pm.to_string(),
+            command: cmd_display,
+            reason: reason.to_string(),
+            status: "planned".to_string(),
+            detail: None,
+        }));
+    }
+
+    let nm_path = target_wt.join("node_modules");
+    let had_nm_before = nm_path.exists();
+    let out = Command::new(pm).args(args).current_dir(target_wt).output();
+    match out {
+        Ok(o) if o.status.success() => Ok(Some(FallbackInstallOutcome {
+            package_manager: pm.to_string(),
+            command: cmd_display,
+            reason: reason.to_string(),
+            status: "installed".to_string(),
+            detail: None,
+        })),
+        Ok(o) => {
+            // If install failed on a fresh worktree and left a partial `node_modules`, remove it
+            // so a subsequent retry does not treat the partial directory as hydrated.
+            if !had_nm_before && nm_path.is_dir() {
+                let _ = fs::remove_dir_all(&nm_path);
+            }
+            Err(CaissonError::CommandFailed {
+                cmd: cmd_display,
+                code: o.status.code(),
+                stderr: String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            })
+        }
+        Err(e) => Err(CaissonError::Message(format!(
+            "fallback install failed to spawn `{pm}`: {e}"
+        ))),
+    }
 }
 
 /// List Caisson worktrees (for the current repo by default, or across all repos with `--all`).

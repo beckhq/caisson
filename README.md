@@ -77,8 +77,16 @@ cargo install --git https://github.com/beckhq/caisson
 
 ### 2. One-Time Setup (`sudo` once; never needed again for worktrees)
 
+Run the guided unprivileged-first onboarding wizard (picks internal or external APFS SSD, invokes `sudo` once for volume + LaunchDaemon, then configures shell integration, coding agents, T3 Code, and checks Developer Tools):
+
 ```bash
-# Audit your Mac's current daemon overhead first (read-only, no sudo)
+caisson setup
+```
+
+Or run the individual steps explicitly:
+
+```bash
+# Audit your Mac's current daemon overhead & fresh-binary exec latency first (read-only, no sudo)
 caisson doctor
 
 # Preview every privileged command before running anything
@@ -89,6 +97,9 @@ sudo caisson init
 
 # Optional: persist `noatime` & shields across reboots via one-shot LaunchDaemon
 sudo caisson daemon install
+
+# Measure real APFS CoW cloning, teardown, and syspolicyd exec latency on your Mac (zero sudo)
+caisson bench
 ```
 
 ### 3. Daily Zero-`sudo` Agent & Developer Worktrees

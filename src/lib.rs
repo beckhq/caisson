@@ -1,12 +1,15 @@
 pub mod agents;
 pub mod apfs;
+pub mod bench;
 pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod doctor;
 pub mod error;
 pub mod registry;
+pub mod setup;
 pub mod t3;
+pub mod tui;
 pub mod units;
 pub mod watch;
 pub mod worktree;

@@ -491,6 +491,54 @@ pub fn list_registered_volumes(registry_path: &Path) -> Result<Vec<VolumeStatusE
     Ok(entries)
 }
 
+/// Escape ASCII/Unicode control characters before displaying untrusted marker/volume labels.
+pub fn sanitize_display_label(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// Scan mounted `/Volumes/*` directories for genuine mounted APFS volumes carrying a valid
+/// `.caisson-volume.json` marker (verified by exact mount-root + live `diskutil info` UUID match)
+/// that are not present in `registered`.
+pub fn discover_unregistered_caisson_volumes(
+    registered: &[VolumeStatusEntry],
+) -> Vec<(PathBuf, VolumeMarker)> {
+    discover_unregistered_caisson_volumes_under(Path::new("/Volumes"), registered)
+        .into_iter()
+        .filter(|(path, marker)| verify_mount_root_matches_uuid(path, &marker.uuid).is_ok())
+        .collect()
+}
+
+pub fn discover_unregistered_caisson_volumes_under(
+    volumes_dir: &Path,
+    registered: &[VolumeStatusEntry],
+) -> Vec<(PathBuf, VolumeMarker)> {
+    let mut found = Vec::new();
+    let Ok(rd) = fs::read_dir(volumes_dir) else {
+        return found;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        if let Ok(marker) = VolumeMarker::read_from(&path) {
+            let already_registered = registered
+                .iter()
+                .any(|r| r.uuid.eq_ignore_ascii_case(&marker.uuid));
+            if !already_registered {
+                found.push((path, marker));
+            }
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
 /// Idempotently re-apply shields to a Caisson volume by name, UUID, or verified APFS mount path.
 ///
 /// Always validates live APFS mount identity and unconditionally rejects protected system roles
@@ -779,5 +827,27 @@ mod tests {
         let reg_path = dir.path().join("registry.json");
         assert!(shield_volume("/", &reg_path, None, true).is_err());
         assert!(shield_volume("/System/Volumes/Data", &reg_path, None, true).is_err());
+    }
+
+    #[test]
+    fn discovers_unregistered_caisson_volume_markers() {
+        let dir = tempdir().unwrap();
+        let vol_a = dir.path().join("caisson");
+        fs::create_dir(&vol_a).unwrap();
+        let marker = VolumeMarker {
+            schema_version: 1,
+            managed_by: "caisson".to_string(),
+            name: "caisson".to_string(),
+            uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+            container: "disk3".to_string(),
+            tier: VolumeTier::Tier1,
+            created_at: Utc::now(),
+        };
+        marker.write_to(&vol_a).unwrap();
+
+        let found = discover_unregistered_caisson_volumes_under(dir.path(), &[]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1.name, "caisson");
+        assert_eq!(found[0].1.uuid, marker.uuid);
     }
 }

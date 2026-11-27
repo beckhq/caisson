@@ -59,7 +59,7 @@ Always pass `--json` when parsing output programmatically.
 caisson wt add <branch> [--from <ref>] [--name <slug>] --json
 
 # Hydrate an existing worktree (e.g. host-managed) from `.caisson.toml` via same-volume APFS CoW
-caisson wt hydrate [--dry-run] [--no-post-create] --json
+caisson wt hydrate [--dry-run] [--fallback-install] [--run-post-create] --json
 
 # List managed worktrees (current repo, or --all across repos)
 caisson wt ls --json
@@ -87,8 +87,11 @@ caisson doctor --json
 ```toml
 [worktree]
 cow_copy = ["node_modules", ".venv", ".turbo"]
+# Optional: explicitly copy non-committed regular files from the main repo checkout (mode 0600 for `.env*`)
+copy_files = [".env.local"]
 ```
 
+- `wt add --json` and `wt hydrate --json` also surface `missing_env_files` (top-level `.env*` files present in the main checkout but absent in the worktree) without ever auto-copying secrets unless listed in `copy_files`.
 - Safe on large (e.g. Chromium-scale) repos: untracked build output directories (`out/`, `target/`, `DerivedData/`) are not copied unless listed in `cow_copy`.
 - **Never put build output directories in `cow_copy`**; restrict `cow_copy` to dependency/package caches.
 

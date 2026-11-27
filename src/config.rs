@@ -78,6 +78,9 @@ pub struct RepoConfig {
 #[serde(default)]
 pub struct RepoWorktreeConfig {
     pub cow_copy: Vec<String>,
+    /// Opt-in list of relative regular files (e.g. `[".env.local"]`) copied from the trusted main
+    /// repository checkout into new/hydrated worktrees if not already present.
+    pub copy_files: Vec<String>,
     pub post_create: Option<String>,
 }
 

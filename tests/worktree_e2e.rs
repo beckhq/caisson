@@ -1051,3 +1051,121 @@ fn wt_hydrate_never_runs_untrusted_branch_post_create_and_rm_respects_tier_prece
     assert_eq!(path_json["dirty"], true);
     assert!(path_json["disk_bytes"].as_u64().unwrap() > 0);
 }
+
+#[test]
+fn v017_copy_files_missing_env_fallback_install_and_setup_non_tty() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = tempdir().unwrap();
+    let repo_dir = sandbox.path().join("env-fallback-repo");
+    let caisson_root = sandbox.path().join("mock-caisson-vol");
+    let config_path = sandbox.path().join("config.toml");
+    fs::create_dir_all(&caisson_root).unwrap();
+    init_sample_repo(&repo_dir);
+
+    fs::write(
+        repo_dir.join(".caisson.toml"),
+        "[worktree]\ncow_copy = [\"node_modules\"]\ncopy_files = [\".env.local\"]\n",
+    )
+    .unwrap();
+    fs::write(repo_dir.join("package.json"), r#"{"name":"demo"}"#).unwrap();
+    fs::write(repo_dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    run_git(
+        &repo_dir,
+        &["add", ".caisson.toml", "package.json", "pnpm-lock.yaml"],
+    );
+    run_git(&repo_dir, &["commit", "-m", "add config and manifest"]);
+
+    // Untracked env files in main repo: `.env.local` (opted in), `.env.secret` (not opted in),
+    // and `.env.example` (public template -> must NOT be reported in missing_env_files).
+    fs::write(repo_dir.join(".env.local"), "API_KEY=secret123\n").unwrap();
+    fs::write(repo_dir.join(".env.secret"), "OTHER=456\n").unwrap();
+    fs::write(repo_dir.join(".env.example"), "API_KEY=\n").unwrap();
+
+    // Create a worktree outside Caisson and run `wt hydrate --fallback-install --dry-run --json`.
+    let wt_dir = sandbox.path().join("ext-wt");
+    run_git(
+        &repo_dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat/env-test",
+            wt_dir.to_str().unwrap(),
+        ],
+    );
+
+    let dry = run_caisson(
+        &wt_dir,
+        &caisson_root,
+        &config_path,
+        &["wt", "hydrate", "--fallback-install", "--dry-run", "--json"],
+    );
+    assert!(
+        dry.status.success(),
+        "dry hydrate failed: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let dry_json: Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(dry_json["copied_files"][0]["entry"], ".env.local");
+    assert_eq!(dry_json["copied_files"][0]["status"], "planned");
+    assert_eq!(dry_json["fallback_install"]["package_manager"], "pnpm");
+    assert_eq!(dry_json["fallback_install"]["status"], "planned");
+    assert_eq!(dry_json["fallback_install"]["reason"], "no-donor");
+    let fb_cmd = dry_json["fallback_install"]["command"].as_str().unwrap();
+    assert!(
+        fb_cmd.contains("--offline"),
+        "must enforce --offline: {fb_cmd}"
+    );
+    assert!(
+        fb_cmd.contains("--ignore-scripts"),
+        "must enforce --ignore-scripts: {fb_cmd}"
+    );
+    assert!(!wt_dir.join(".env.local").exists());
+
+    // Place a dangling symlink at `.env.secret` in target worktree: must STILL be reported as missing!
+    std::os::unix::fs::symlink(
+        sandbox.path().join("nonexistent"),
+        wt_dir.join(".env.secret"),
+    )
+    .unwrap();
+
+    // Real hydrate (without --fallback-install so no external pnpm needed): copies `.env.local` with 0600,
+    // reports `.env.secret` in `missing_env_files` (despite dangling symlink), and excludes `.env.example`.
+    let hyd = run_caisson(
+        &wt_dir,
+        &caisson_root,
+        &config_path,
+        &["wt", "hydrate", "--json"],
+    );
+    assert!(hyd.status.success());
+    let hyd_json: Value = serde_json::from_slice(&hyd.stdout).unwrap();
+    assert_eq!(hyd_json["copied_files"][0]["status"], "copied");
+    assert_eq!(
+        fs::read_to_string(wt_dir.join(".env.local")).unwrap(),
+        "API_KEY=secret123\n"
+    );
+    let mode = fs::metadata(wt_dir.join(".env.local"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, ".env* copied files must have mode 0600");
+    let missing: Vec<&str> = hyd_json["missing_env_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(missing, vec![".env.secret"]);
+
+    // Non-TTY `caisson setup` fails cleanly with actionable scripted commands.
+    let setup_out = Command::new(caisson_bin())
+        .args(["setup", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!setup_out.status.success());
+    let err_txt = String::from_utf8_lossy(&setup_out.stderr);
+    assert!(err_txt.contains("interactive terminal"));
+    assert!(err_txt.contains("sudo caisson init"));
+}

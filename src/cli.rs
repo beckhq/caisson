@@ -25,6 +25,33 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Interactive unprivileged-first onboarding wizard (drive picker, single-sudo seal & daemon, shell, agents, T3, exec probe).
+    Setup {
+        /// Preview planned actions without running `sudo` or editing files in `$HOME`.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip LaunchDaemon installation prompt.
+        #[arg(long)]
+        no_daemon: bool,
+
+        /// Skip shell profile (`~/.zshrc` / `~/.bashrc` / `config.fish`) integration prompt.
+        #[arg(long)]
+        no_shell: bool,
+
+        /// Skip coding-agent skill installation prompt.
+        #[arg(long)]
+        no_agents: bool,
+
+        /// Skip T3 Code worktree location prompt.
+        #[arg(long)]
+        no_t3: bool,
+
+        /// Skip the live `syspolicyd` 2-binary exec latency probe.
+        #[arg(long)]
+        no_probe: bool,
+    },
+
     /// Create and shield the shared Tier-1 workspace APFS volume (default: /Volumes/caisson).
     Init {
         /// Volume name (lowercase [a-z0-9][a-z0-9._-]*, no spaces).
@@ -98,6 +125,17 @@ pub enum Commands {
 
     /// Audit macOS developer I/O health: daemon CPU/RSS, fseventsd bloat, snapshots, leaked DMGs, shields.
     Doctor,
+
+    /// Run a self-contained APFS CoW cloning, teardown, and `syspolicyd` first-exec micro-benchmark (zero sudo).
+    Bench {
+        /// Number of synthetic files to clone and remove (10..=20000).
+        #[arg(long, default_value_t = 1000)]
+        files: usize,
+
+        /// Directory to benchmark inside (defaults to active Caisson volume root or temp dir).
+        #[arg(long)]
+        target: Option<PathBuf>,
+    },
 
     /// Passive read-only macOS daemon & system telemetry sampler for long builds.
     Watch {
@@ -370,6 +408,11 @@ pub enum WtCommands {
         /// (disabled by default so untrusted branches cannot trigger shell commands during hydration).
         #[arg(long)]
         run_post_create: bool,
+
+        /// Opt-in package-manager install fallback when no `node_modules` donor exists or the donor's
+        /// lockfile differs from the target worktree (runs offline/frozen install directly without `/bin/sh`).
+        #[arg(long)]
+        fallback_install: bool,
     },
 }
 

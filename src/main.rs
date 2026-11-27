@@ -5,9 +5,10 @@ use caisson::agents::{
 };
 use caisson::apfs::clonefile::clone_path;
 use caisson::apfs::volume::{
-    build_status_report, create_volume, destroy_volume, list_registered_volumes, shield_volume,
-    CreateVolumeOptions, QuotaSpec,
+    build_status_report, create_volume, destroy_volume, discover_unregistered_caisson_volumes,
+    list_registered_volumes, sanitize_display_label, shield_volume, CreateVolumeOptions, QuotaSpec,
 };
+use caisson::bench::{format_bench_human, run_bench, BenchOptions};
 use caisson::cli::{
     AgentCommands, Cli, Commands, ConfigCommands, DaemonCommands, ShellKind, T3Commands,
     VolCommands, WtCommands,
@@ -19,6 +20,7 @@ use caisson::daemon::launchd::{
 use caisson::doctor::{format_doctor_human, run_doctor};
 use caisson::error::{CaissonError, Result};
 use caisson::registry::{VolumeRegistry, VolumeTier};
+use caisson::setup::{run_setup, SetupOptions};
 use caisson::t3::{format_t3_next_steps, is_t3_installed, run_t3_setup, T3SetupOptions};
 use caisson::units::format_bytes;
 use caisson::watch::{run_watch, WatchOptions};
@@ -95,6 +97,31 @@ fn dispatch(cli: Cli) -> Result<()> {
     let config_path = CaissonConfig::default_path();
 
     match cli.command {
+        Commands::Setup {
+            dry_run,
+            no_daemon,
+            no_shell,
+            no_agents,
+            no_t3,
+            no_probe,
+        } => {
+            let report = run_setup(
+                &registry_path,
+                &config_path,
+                &SetupOptions {
+                    dry_run,
+                    no_daemon,
+                    no_shell,
+                    no_agents,
+                    no_t3,
+                    no_probe,
+                },
+            )?;
+            if json {
+                print_json(&report)?;
+            }
+        }
+
         Commands::Init {
             name,
             quota,
@@ -242,9 +269,36 @@ fn dispatch(cli: Cli) -> Result<()> {
                 if json {
                     print_json(&volumes)?;
                 } else if volumes.is_empty() {
-                    println!(
-                        "No Caisson volumes registered. Run `sudo caisson init` to create one."
-                    );
+                    let custom_reg = std::env::var("CAISSON_REGISTRY")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty());
+                    let unregistered = discover_unregistered_caisson_volumes(&volumes);
+                    if let Some(ref reg_override) = custom_reg {
+                        println!("No Caisson volumes registered in {reg_override}.");
+                    } else {
+                        println!("No Caisson volumes registered.");
+                    }
+                    if !unregistered.is_empty() {
+                        println!(
+                            "Found {} existing Caisson volume(s) mounted on disk not listed in this registry:",
+                            unregistered.len()
+                        );
+                        for (path, marker) in &unregistered {
+                            println!(
+                                "  - '{}' ({}) -> {}",
+                                sanitize_display_label(&marker.name),
+                                sanitize_display_label(&marker.uuid),
+                                sanitize_display_label(&path.display().to_string())
+                            );
+                        }
+                        if custom_reg.is_some() {
+                            println!(
+                                "Hint: unset `CAISSON_REGISTRY` to view the default system registry."
+                            );
+                        }
+                    } else if custom_reg.is_none() {
+                        println!("Run `caisson setup` or `sudo caisson init` to create one.");
+                    }
                 } else {
                     println!(
                         "{:<18} {:<7} {:<10} {:<10} {:<10} MOUNT",
@@ -535,6 +589,22 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
         }
 
+        Commands::Bench { files, target } => {
+            let cfg = CaissonConfig::load_from(&config_path)?;
+            let report = run_bench(
+                &cfg,
+                &BenchOptions {
+                    files,
+                    target_dir: target,
+                },
+            )?;
+            if json {
+                print_json(&report)?;
+            } else {
+                print!("{}", format_bench_human(&report));
+            }
+        }
+
         Commands::Watch {
             label,
             out,
@@ -634,6 +704,19 @@ fn dispatch(cli: Cli) -> Result<()> {
                             } else if let Some(ref detail) = c.detail {
                                 eprintln!("cow-copy '{}' ({}): {detail}", c.entry, c.status);
                             }
+                        }
+                        for f in &report.copied_files {
+                            if f.status == "copied" {
+                                eprintln!("copied '{}' from main repo", f.entry);
+                            } else if let Some(ref detail) = f.detail {
+                                eprintln!("copy-file '{}' ({}): {detail}", f.entry, f.status);
+                            }
+                        }
+                        if !report.missing_env_files.is_empty() {
+                            eprintln!(
+                                "note: main repo has env file(s) not present in this worktree: {} (opt in via `.caisson.toml` `copy_files`)",
+                                report.missing_env_files.join(", ")
+                            );
                         }
                         // Print canonical worktree path on stdout for easy shell capture (`cd "$(caisson wt add ...)"`).
                         println!("{}", report.path);
@@ -780,6 +863,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                     path,
                     dry_run,
                     run_post_create,
+                    fallback_install,
                 } => {
                     let report = wt_hydrate(
                         &cfg,
@@ -787,13 +871,18 @@ fn dispatch(cli: Cli) -> Result<()> {
                             path,
                             dry_run,
                             run_post_create,
+                            fallback_install,
                         },
                     )?;
                     if json {
                         print_json(&report)?;
                     } else {
                         let prefix = if report.dry_run { "[dry-run] " } else { "" };
-                        if report.cow_clones.is_empty() && report.post_create_command.is_none() {
+                        if report.cow_clones.is_empty()
+                            && report.copied_files.is_empty()
+                            && report.fallback_install.is_none()
+                            && report.post_create_command.is_none()
+                        {
                             println!(
                                 "{prefix}Hydrate {}: no .caisson.toml cow_copy entries configured.",
                                 report.worktree_path
@@ -824,6 +913,39 @@ fn dispatch(cli: Cli) -> Result<()> {
                                     ),
                                 }
                             }
+                            for f in &report.copied_files {
+                                match f.status.as_str() {
+                                    "copied" => {
+                                        println!("{prefix}copied '{}' from main repo", f.entry)
+                                    }
+                                    "planned" => {
+                                        println!("{prefix}would copy '{}' from main repo", f.entry)
+                                    }
+                                    _ => println!(
+                                        "{prefix}copy-file '{}' ({}): {}",
+                                        f.entry,
+                                        f.status,
+                                        f.detail.as_deref().unwrap_or("")
+                                    ),
+                                }
+                            }
+                            if let Some(ref fb) = report.fallback_install {
+                                match fb.status.as_str() {
+                                    "installed" => println!(
+                                        "fallback-installed via `{}` (reason: {})",
+                                        fb.command, fb.reason
+                                    ),
+                                    "planned" => println!(
+                                        "{prefix}would run fallback install `{}` (reason: {})",
+                                        fb.command, fb.reason
+                                    ),
+                                    _ => println!(
+                                        "{prefix}fallback-install ({}): {}",
+                                        fb.status,
+                                        fb.detail.as_deref().unwrap_or("")
+                                    ),
+                                }
+                            }
                             if let Some(ref hook) = report.post_create_command {
                                 if report.dry_run {
                                     println!("{prefix}would run post_create: {hook}");
@@ -831,6 +953,12 @@ fn dispatch(cli: Cli) -> Result<()> {
                                     println!("ran post_create: {hook}");
                                 }
                             }
+                        }
+                        if !report.missing_env_files.is_empty() {
+                            println!(
+                                "note: main repo has env file(s) not present in this worktree: {} (opt in via `.caisson.toml` `copy_files`)",
+                                report.missing_env_files.join(", ")
+                            );
                         }
                     }
                 }
