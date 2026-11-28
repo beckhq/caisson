@@ -159,6 +159,12 @@ cargo install --git https://github.com/beckhq/caisson
 
 Run the unprivileged-first interactive wizard (picks your internal Mac SSD or external APFS SSD, invokes `/usr/bin/sudo` once for volume creation + LaunchDaemon, then configures shell integration, coding agents, T3 Code, and probes `syspolicyd` latency):
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/cli-setup-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset="./docs/assets/cli-setup-light.svg" />
+  <img alt="caisson setup interactive terminal wizard" src="./docs/assets/cli-setup-dark.svg" width="100%" />
+</picture>
+
 ```bash
 # Preview everything first with zero disk changes
 caisson setup --dry-run
@@ -189,6 +195,12 @@ caisson bench
 ### 3. Daily Zero-`sudo` Agent & Developer Worktrees
 
 Run directly inside **any existing git repository**, with no need to move `~/workspace`:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./docs/assets/cli-worktrees-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset="./docs/assets/cli-worktrees-light.svg" />
+  <img alt="caisson daily zero-sudo worktree workflow" src="./docs/assets/cli-worktrees-dark.svg" width="100%" />
+</picture>
 
 ```bash
 # Create an isolated worktree on /Volumes/caisson (with instant APFS CoW dependency cloning)

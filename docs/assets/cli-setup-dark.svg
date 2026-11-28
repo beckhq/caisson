@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="550" viewBox="0 0 760 550" role="img" aria-label="caisson setup interactive terminal wizard">
+  <defs><style>.m { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11.8px; }</style></defs>
+  <rect x="0.5" y="0.5" width="759" height="549" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+  <path d="M 1 12 Q 1 1 12 1 L 748 1 Q 759 1 759 12 L 759 34 L 1 34 Z" fill="#161b22"/>
+  <line x1="1" y1="34" x2="759" y2="34" stroke="#30363d" stroke-width="1"/>
+  <circle cx="20" cy="17.5" r="5.5" fill="#ef4444" opacity="0.9"/>
+  <circle cx="38" cy="17.5" r="5.5" fill="#f59e0b" opacity="0.9"/>
+  <circle cx="56" cy="17.5" r="5.5" fill="#22c55e" opacity="0.9"/>
+  <text x="380" y="21.5" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="11" fill="#8b949e">zsh · caisson setup (unprivileged-first)</text>
+  <text x="20" y="56" class="m" xml:space="preserve"><tspan fill="#34d399" font-weight="700">❯ </tspan><tspan fill="#e6edf3">caisson setup</tspan></text>
+  <rect x="20" y="68" width="720" height="32" rx="2" fill="none" stroke="#38bdf8" stroke-width="1.2"/>
+  <rect x="23" y="71" width="714" height="26" rx="1" fill="none" stroke="#38bdf8" stroke-width="1"/>
+  <rect x="34" y="75" width="66" height="18" rx="2" fill="#38bdf8"/>
+  <text x="67" y="88" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="11" font-weight="700" fill="#042f2e">CAISSON</text>
+  <text x="112" y="88" class="m" fill="#e6edf3" font-weight="700">APFS Workspace Setup</text>
+  <text x="724" y="88" text-anchor="end" class="m" fill="#8b949e">v0.1.9 · diving-bell mode</text>
+  <text x="20" y="120" class="m" xml:space="preserve"><tspan fill="#8b949e">│  </tspan><tspan fill="#8b949e">Unprivileged wizard: sudo is only invoked once for APFS + LaunchDaemon.</tspan></text>
+  <text x="20" y="138.5" class="m" xml:space="preserve"><tspan fill="#38bdf8" font-weight="700">◆  </tspan><tspan fill="#e6edf3" font-weight="700">Step 1/5 · Target APFS Container &amp; Hard Quota</tspan></text>
+  <text x="20" y="157.0" class="m" xml:space="preserve"><tspan fill="#8b949e">│   </tspan><tspan fill="#34d399" font-weight="700">(●) </tspan><tspan fill="#e6edf3" font-weight="700">Internal Mac SSD (disk3)</tspan></text>
+  <text x="20" y="175.5" class="m" xml:space="preserve"><tspan fill="#8b949e">│       </tspan><tspan fill="#8b949e">[</tspan><tspan fill="#38bdf8">███████████</tspan><tspan fill="#8b949e">░░░░░░░</tspan><tspan fill="#8b949e">] 62% used · 380 GiB free / 1.0 TiB</tspan></text>
+  <text x="20" y="194.0" class="m" xml:space="preserve"><tspan fill="#8b949e">│   </tspan><tspan fill="#8b949e">( ) </tspan><tspan fill="#8b949e">External APFS SSD (disk5 -&gt; /Volumes/work-ssd) · 1.57 TiB free</tspan></text>
+  <text x="20" y="212.5" class="m" xml:space="preserve"><tspan fill="#34d399" font-weight="700">✓  </tspan><tspan fill="#8b949e">Target: /Volumes/caisson (auto quota 280 GiB)</tspan></text>
+  <text x="20" y="234.0" class="m" xml:space="preserve"><tspan fill="#38bdf8" font-weight="700">◆  </tspan><tspan fill="#e6edf3" font-weight="700">Step 2/5 · Privileged Seal &amp; Boot LaunchDaemon</tspan></text>
+  <text x="20" y="252.5" class="m" xml:space="preserve"><tspan fill="#8b949e">│    </tspan><tspan fill="#38bdf8">sudo caisson init --no-agents --container disk3</tspan></text>
+  <text x="20" y="271.0" class="m" xml:space="preserve"><tspan fill="#8b949e">│    </tspan><tspan fill="#38bdf8">sudo caisson daemon install</tspan><tspan fill="#8b949e">  (RunAtLoad + StartOnMount)</tspan></text>
+  <text x="20" y="289.5" class="m" xml:space="preserve"><tspan fill="#34d399" font-weight="700">✓  </tspan><tspan fill="#8b949e">Volume sealed (noatime, Spotlight off, fseventsd no_log, TM excluded)</tspan></text>
+  <text x="20" y="311.0" class="m" xml:space="preserve"><tspan fill="#38bdf8" font-weight="700">◆  </tspan><tspan fill="#e6edf3" font-weight="700">Step 3/5 · Shell Integration &amp; Coding Agents (unprivileged)</tspan></text>
+  <text x="20" y="329.5" class="m" xml:space="preserve"><tspan fill="#34d399" font-weight="700">✓  </tspan><tspan fill="#8b949e">Shell: ~/.zshrc · Agents: claude, codex, antigravity</tspan></text>
+  <text x="20" y="351.0" class="m" xml:space="preserve"><tspan fill="#38bdf8" font-weight="700">◆  </tspan><tspan fill="#e6edf3" font-weight="700">Step 4/5 · T3 Code Worktrees &amp; Live syspolicyd Exec Probe</tspan></text>
+  <text x="20" y="369.5" class="m" xml:space="preserve"><tspan fill="#8b949e">│  </tspan><tspan fill="#34d399" font-weight="700">✓ </tspan><tspan fill="#e6edf3">Fresh binary exec fast (1.89 ms 1st vs 1.42 ms cached · Developer Tools active)</tspan></text>
+  <text x="20" y="388.0" class="m" xml:space="preserve"><tspan fill="#34d399" font-weight="700">✓  </tspan><tspan fill="#8b949e">T3 &amp; exec probe complete</tspan></text>
+  <text x="20" y="412.5" class="m" xml:space="preserve"><tspan fill="#34d399" font-weight="700">✓  </tspan><tspan fill="#e6edf3" font-weight="700">CAISSON CHAMBER SEALED &amp; READY</tspan></text>
+  <line x1="20" y1="421.0" x2="730" y2="421.0" stroke="#30363d" stroke-width="1"/>
+  <line x1="20" y1="421.0" x2="20" y2="525.0" stroke="#30363d" stroke-width="1"/>
+  <line x1="20" y1="525.0" x2="730" y2="525.0" stroke="#30363d" stroke-width="1"/>
+  <text x="20" y="439.0" class="m" xml:space="preserve"><tspan fill="#8b949e">  Volume       </tspan><tspan fill="#34d399" font-weight="700">● READY   </tspan><tspan fill="#e6edf3">/Volumes/caisson (internal, auto 280 GiB)</tspan></text>
+  <text x="20" y="457.5" class="m" xml:space="preserve"><tspan fill="#8b949e">  LaunchDaemon </tspan><tspan fill="#34d399" font-weight="700">● LOADED  </tspan><tspan fill="#e6edf3">dev.caisson.mount (boot + StartOnMount)</tspan></text>
+  <text x="20" y="476.0" class="m" xml:space="preserve"><tspan fill="#8b949e">  Shell Hook   </tspan><tspan fill="#34d399" font-weight="700">● ACTIVE  </tspan><tspan fill="#e6edf3">~/.zshrc (caisson wt cd + cai alias)</tspan></text>
+  <text x="20" y="494.5" class="m" xml:space="preserve"><tspan fill="#8b949e">  Agent Skills </tspan><tspan fill="#34d399" font-weight="700">● SYNCED  </tspan><tspan fill="#e6edf3">claude, codex, antigravity</tspan></text>
+  <text x="20" y="513.0" class="m" xml:space="preserve"><tspan fill="#8b949e">  Exec Probe   </tspan><tspan fill="#34d399" font-weight="700">● FAST    </tspan><tspan fill="#e6edf3">1.89 ms 1st exec vs 1.42 ms cached</tspan></text>
+  <text x="20" y="541.5" class="m" xml:space="preserve"><tspan fill="#8b949e">Try it now:  </tspan><tspan fill="#38bdf8" font-weight="700">caisson status</tspan><tspan fill="#8b949e">  ·  </tspan><tspan fill="#38bdf8" font-weight="700">caisson bench</tspan><tspan fill="#8b949e">  ·  </tspan><tspan fill="#38bdf8" font-weight="700">caisson wt add feat/demo</tspan></text>
+</svg>
